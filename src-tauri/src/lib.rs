@@ -231,8 +231,8 @@ fn spawn_context_server() {
     // Start the server in the background
     let server_proc = Command::new("python")
         .arg(&script)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
         .spawn();
 
     match server_proc {
