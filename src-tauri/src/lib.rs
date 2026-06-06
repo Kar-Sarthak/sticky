@@ -3,7 +3,8 @@ mod models;
 use models::{Note, TodoItem};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use tauri::Emitter;
 use tauri::Manager;
 use tauri::menu::{Menu, MenuItemBuilder, PredefinedMenuItem};
 use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
@@ -343,9 +344,16 @@ async fn add_todo(app: tauri::AppHandle, note_id: String, task: String) -> Resul
 async fn toggle_todo(app: tauri::AppHandle, todo_id: String) -> Result<(), String> {
     let mut todos = get_all_todos(&app)?;
 
+    let mut new_status = None;
     if let Some(todo) = todos.iter_mut().find(|t| t.id == todo_id) {
         todo.status = if todo.status == "done" { "undone".to_string() } else { "done".to_string() };
-        save_all_todos(&app, &todos)?;
+        new_status = Some(todo.status.clone());
+    }
+    save_all_todos(&app, &todos)?;
+
+    // Notify all windows to refresh their todo lists
+    if let Some(status) = new_status {
+        app.emit("todo-updated", serde_json::json!({ "todoId": todo_id, "status": status })).ok();
     }
 
     Ok(())
@@ -647,6 +655,144 @@ async fn note_hidden(app: tauri::AppHandle, is_destroying: bool) {
     }
 }
 
+// ─── Reminder Window ───
+
+/// Spawn the reminder window (once, at startup).
+fn spawn_reminder_window(app: &tauri::AppHandle) {
+    if app.get_webview_window("reminder").is_some() {
+        return;
+    }
+
+    // Position at top-center of primary monitor
+    let (x, y) = match app.primary_monitor() {
+        Ok(Some(monitor)) => {
+            let size = monitor.size();
+            let scale = monitor.scale_factor();
+            (
+                (size.width as f64 / scale - 260.0) / 2.0,
+                10.0,
+            )
+        }
+        _ => (830.0, 10.0), // fallback
+    };
+
+    tauri::WebviewWindowBuilder::new(
+        app,
+        "reminder",
+        tauri::WebviewUrl::App("index.html#reminder".into()),
+    )
+    .title("Reminders")
+    .inner_size(260.0, 200.0)
+    .position(x, y)
+    .resizable(false)
+    .decorations(false)
+    .transparent(true)
+    .always_on_top(true)
+    .skip_taskbar(true)
+    .build()
+    .ok();
+}
+
+/// Show matching todos in the reminder window.
+fn show_reminder(app: &tauri::AppHandle, todos: Vec<serde_json::Value>, context: String) {
+    if let Some(win) = app.get_webview_window("reminder") {
+        let payload = serde_json::json!({ "todos": todos, "context": context });
+        win.emit("reminder-data", payload).ok();
+        win.show().ok();
+    }
+}
+
+/// Clear the reminder window (show placeholder).
+fn clear_reminder(app: &tauri::AppHandle) {
+    if let Some(win) = app.get_webview_window("reminder") {
+        let payload = serde_json::json!({ "todos": [], "context": "" });
+        win.emit("reminder-data", payload).ok();
+    }
+}
+
+// ─── HTTP Server for Python Monitor ───
+
+const REMINDER_SERVER_PORT: u16 = 8766;
+
+fn start_reminder_http_server(app: tauri::AppHandle) {
+    use std::sync::Arc;
+
+    std::thread::spawn(move || {
+        use tiny_http::{Server, Response};
+        use std::io::Read;
+
+        let server = match Server::http(format!("127.0.0.1:{}", REMINDER_SERVER_PORT)) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("[reminder-http] Failed to start server: {}", e);
+                return;
+            }
+        };
+        println!("[reminder-http] Server running on port {}", REMINDER_SERVER_PORT);
+
+        let app = Arc::new(app);
+
+        for request in server.incoming_requests() {
+            handle_reminder_request(&app, request);
+        }
+    });
+}
+
+fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::Request) {
+    use tiny_http::{Method, Response};
+    use std::io::Cursor;
+
+    // Only accept POST to /remind
+    if request.method() != &Method::Post || request.url() != "/remind" {
+        let body = Cursor::new(b"{}");
+        let _ = request.respond(Response::new(
+            tiny_http::StatusCode(404),
+            Vec::new(),
+            body,
+            None,
+            None,
+        ));
+        return;
+    }
+
+    // Read the request body
+    let mut body = Vec::new();
+    if request.as_reader().read_to_end(&mut body).is_err() {
+        return;
+    }
+
+    // Parse the JSON payload
+    let payload: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("[reminder-http] JSON parse error: {}", e);
+            return;
+        }
+    };
+
+    // Extract todos and context
+    if let Some(todos) = payload["todos"].as_array() {
+        let todos: Vec<serde_json::Value> = todos.iter().cloned().collect();
+        let context = payload["context"].as_str().unwrap_or("").to_string();
+        if !todos.is_empty() {
+            show_reminder(app, todos, context);
+        } else {
+            clear_reminder(app);
+        }
+    } else {
+        clear_reminder(app);
+    }
+
+    let resp_body = Cursor::new(b"{\"status\":\"ok\"}");
+    let _ = request.respond(Response::new(
+        tiny_http::StatusCode(200),
+        Vec::new(),
+        resp_body,
+        None,
+        None,
+    ));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -682,6 +828,12 @@ pub fn run() {
 
             // Spawn the Python context classifier server
             spawn_context_server();
+
+            // --- Spawn the reminder window (single, always exists) ---
+            spawn_reminder_window(app.handle());
+
+            // --- Start HTTP server for Python monitor ---
+            start_reminder_http_server(app.handle().clone());
 
             // Check if notes exist and are non-empty; create a default note if not.
             let needs_default = match store.get("notes") {

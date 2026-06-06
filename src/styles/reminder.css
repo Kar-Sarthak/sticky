@@ -1,0 +1,70 @@
+/* ---------- Reminder Window ---------- */
+
+.reminder-window {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+  border-radius: 8px;
+  background: #FFE066;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08), 0 1px 3px rgba(0, 0, 0, 0.06);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.reminder-window::-webkit-scrollbar {
+  display: none;
+}
+
+.reminder-window {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+.reminder-todo-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
+  /* Ruled paper line */
+  background-image: repeating-linear-gradient(
+    transparent,
+    transparent 23px,
+    rgba(0, 0, 0, 0.04) 23px,
+    rgba(0, 0, 0, 0.04) 24px
+  );
+}
+
+.reminder-todo-item:last-child {
+  border-bottom: none;
+}
+
+.reminder-checkbox {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 14px;
+  padding: 0;
+  flex-shrink: 0;
+}
+
+.reminder-todo-text {
+  font-family: "Permanent Marker", cursive;
+  font-size: 14px;
+  color: rgba(0, 0, 0, 0.6);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reminder-placeholder {
+  font-family: "Permanent Marker", cursive;
+  font-size: 13px;
+  color: rgba(0, 0, 0, 0.25);
+  text-align: center;
+  padding: 20px 10px;
+  font-style: italic;
+}

@@ -44,9 +44,21 @@ export default function NoteWindow() {
     });
 
     // Load todos for this note
-    invoke<TodoItem[]>("get_note_todos", { noteId })
-      .then(setTodos)
-      .catch(console.error);
+    const loadTodos = () => {
+      invoke<TodoItem[]>("get_note_todos", { noteId })
+        .then(setTodos)
+        .catch(console.error);
+    };
+    loadTodos();
+
+    // Listen for todo updates from other windows
+    const unlistenTodoUpdated = getCurrentWindow().listen("todo-updated", () => {
+      loadTodos();
+    });
+
+    return () => {
+      unlistenTodoUpdated.then((f) => f());
+    };
   }, []);
 
   // --- Poll note count so the delete button reflects current state ---

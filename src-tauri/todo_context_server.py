@@ -273,13 +273,17 @@ def get_todos_for_contexts(active_contexts):
 
 
 def monitor_loop():
-    """Background thread that polls the active window and shows todo reminders."""
+    """Background thread that polls the active window and sends reminders to Rust."""
     if not HAS_WINDOW_DEPS:
         return
 
     # Initialize COM for this background thread (uiautomation requires it)
     import comtypes
     comtypes.CoInitialize()
+
+    import urllib.request
+
+    REMINDER_URL = "http://127.0.0.1:8766/remind"
 
     last_title = None
     last_url = None
@@ -305,6 +309,19 @@ def monitor_loop():
             url_changed = url != last_url
             process_changed = process != last_process
             context_changed = set(active_contexts) != set(last_contexts)
+
+            # On context change: immediately clear reminder
+            if context_changed or title_changed or process_changed:
+                try:
+                    req = urllib.request.Request(
+                        REMINDER_URL,
+                        data=json.dumps({"todos": [], "context": ""}).encode(),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    urllib.request.urlopen(req, timeout=2)
+                except Exception:
+                    pass
 
             # Find matching todos
             matched_todos = get_todos_for_contexts(active_contexts) if active_contexts else []
@@ -337,16 +354,36 @@ def monitor_loop():
                 last_url = url
                 last_process = process
                 last_contexts = active_contexts
-                last_todo_ids = current_todo_ids
-            elif todos_changed and matched_todos:
-                # Same context but todos changed
-                print(f"  📋 Todo list updated for {', '.join(active_contexts)}:", flush=True)
-                for todo in matched_todos:
-                    done = "✅" if todo.get("status") == "done" else "☐"
-                    task = todo.get("task", "??")
-                    print(f"     {done} {task}", flush=True)
-                print()
-                last_todo_ids = current_todo_ids
+
+            # Send reminder immediately (no delay)
+            if matched_todos and (todos_changed or context_changed or title_changed or process_changed):
+                try:
+                    ctx_str = ", ".join(active_contexts) if active_contexts else ""
+                    payload = json.dumps({"todos": matched_todos, "context": ctx_str}).encode()
+                    req = urllib.request.Request(
+                        REMINDER_URL,
+                        data=payload,
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    urllib.request.urlopen(req, timeout=2)
+                except Exception as e:
+                    print(f"  [reminder] Failed to send: {e}", flush=True)
+
+            elif not matched_todos and (todos_changed or context_changed):
+                # No todos, clear reminder
+                try:
+                    req = urllib.request.Request(
+                        REMINDER_URL,
+                        data=json.dumps({"todos": [], "context": ""}).encode(),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    urllib.request.urlopen(req, timeout=2)
+                except Exception:
+                    pass
+
+            last_todo_ids = current_todo_ids
 
         except Exception as e:
             print(f"  [monitor error] {e}", flush=True)
