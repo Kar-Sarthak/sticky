@@ -164,6 +164,9 @@ CONTEXT_PROCESS_MAP = {
     "androidstudio64.exe":  "android studio",
 }
 
+# Process names that belong to our own app — ignore these for context detection
+OWN_APP_PROCESSES = {"sticky-notes.exe", "sticky_notes.exe"}
+
 
 def detect_current_contexts(title, process, hwnd):
     """Returns (list_of_contexts, url) for the current active window."""
@@ -290,6 +293,7 @@ def monitor_loop():
     last_process = None
     last_contexts = []
     last_todo_ids = []
+    own_window_active = False
 
     print("\n🔍 Window monitor active — watching active window...")
 
@@ -300,6 +304,20 @@ def monitor_loop():
             if title is None or process is None:
                 time.sleep(POLL_INTERVAL)
                 continue
+
+            # Check if the active window is one of our own app's windows
+            is_own_window = process in OWN_APP_PROCESSES
+
+            if is_own_window:
+                # Our app has focus — don't change the reminder, just keep polling
+                if not own_window_active:
+                    own_window_active = True
+                    print(f"  [own window active — keeping current context]", flush=True)
+                time.sleep(POLL_INTERVAL)
+                continue
+            else:
+                if own_window_active:
+                    own_window_active = False
 
             # Detect context (URL + process mapping)
             active_contexts, url = detect_current_contexts(title, process, hwnd)
