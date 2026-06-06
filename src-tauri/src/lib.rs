@@ -1,0 +1,806 @@
+mod models;
+
+use models::{Note, TodoItem};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
+use tauri::Manager;
+use tauri::menu::{Menu, MenuItemBuilder, PredefinedMenuItem};
+use tauri::tray::{MouseButton, TrayIconBuilder, TrayIconEvent};
+use tauri_plugin_global_shortcut::{
+    Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState,
+};
+use tauri_plugin_store::StoreExt;
+use uuid::Uuid;
+
+/// State to track the currently registered global shortcut so we can
+/// unregister it when the user changes the hotkey in Preferences.
+struct GlobalShortcutState {
+    current: Mutex<Option<Shortcut>>,
+}
+
+/// Tracks whether notes should be visible (true) or hidden (false).
+/// Close/hide on a single window doesn't change this — only the hotkey toggles it.
+struct NotesVisibility {
+    notes_visible: Mutex<bool>,
+}
+
+/// Toggle visibility of all note windows.
+/// If notes_visible == true → hide all notes, set notes_visible = false.
+/// If notes_visible == false → show all notes, set notes_visible = true.
+fn toggle_note_windows(app: &tauri::AppHandle) {
+    let Some(state) = app.try_state::<NotesVisibility>() else {
+        return;
+    };
+    let mut visible = state.notes_visible.lock().expect("poisoned lock");
+
+    if *visible {
+        for (label, _) in app.webview_windows().iter() {
+            if label.starts_with("note-") {
+                if let Some(win) = app.get_webview_window(label) {
+                    win.hide().ok();
+                }
+            }
+        }
+        *visible = false;
+    } else {
+        for (label, _) in app.webview_windows().iter() {
+            if label.starts_with("note-") {
+                if let Some(win) = app.get_webview_window(label) {
+                    win.show().ok();
+                    win.set_focus().ok();
+                }
+            }
+        }
+        *visible = true;
+    }
+}
+
+/// Parse a hotkey string like "CommandOrControl+Shift+S" into a Shortcut.
+fn parse_hotkey_string(s: &str) -> Option<Shortcut> {
+    let parts: Vec<&str> = s.split('+').collect();
+    if parts.len() < 2 {
+        return None;
+    }
+
+    let mut modifiers = Modifiers::empty();
+    let mut code: Option<Code> = None;
+
+    for part in &parts[..parts.len() - 1] {
+        let m = match *part {
+            "Control" => Modifiers::CONTROL,
+            "CommandOrControl" => Modifiers::CONTROL,
+            "Alt" => Modifiers::ALT,
+            "Shift" => Modifiers::SHIFT,
+            "Super" => Modifiers::SUPER,
+            _ => Modifiers::empty(),
+        };
+        modifiers |= m;
+    }
+
+    let key = parts.last().unwrap();
+    if key.len() == 1 {
+        if let Some(c) = key.chars().next() {
+            code = match c.to_ascii_uppercase() {
+                'A' => Some(Code::KeyA),
+                'B' => Some(Code::KeyB),
+                'C' => Some(Code::KeyC),
+                'D' => Some(Code::KeyD),
+                'E' => Some(Code::KeyE),
+                'F' => Some(Code::KeyF),
+                'G' => Some(Code::KeyG),
+                'H' => Some(Code::KeyH),
+                'I' => Some(Code::KeyI),
+                'J' => Some(Code::KeyJ),
+                'K' => Some(Code::KeyK),
+                'L' => Some(Code::KeyL),
+                'M' => Some(Code::KeyM),
+                'N' => Some(Code::KeyN),
+                'O' => Some(Code::KeyO),
+                'P' => Some(Code::KeyP),
+                'Q' => Some(Code::KeyQ),
+                'R' => Some(Code::KeyR),
+                'S' => Some(Code::KeyS),
+                'T' => Some(Code::KeyT),
+                'U' => Some(Code::KeyU),
+                'V' => Some(Code::KeyV),
+                'W' => Some(Code::KeyW),
+                'X' => Some(Code::KeyX),
+                'Y' => Some(Code::KeyY),
+                'Z' => Some(Code::KeyZ),
+                _ => None,
+            };
+        }
+    } else {
+        code = match *key {
+            "F1" => Some(Code::F1),
+            "F2" => Some(Code::F2),
+            "F3" => Some(Code::F3),
+            "F4" => Some(Code::F4),
+            "F5" => Some(Code::F5),
+            "F6" => Some(Code::F6),
+            "F7" => Some(Code::F7),
+            "F8" => Some(Code::F8),
+            "F9" => Some(Code::F9),
+            "F10" => Some(Code::F10),
+            "F11" => Some(Code::F11),
+            "F12" => Some(Code::F12),
+            "Space" => Some(Code::Space),
+            "Enter" => Some(Code::Enter),
+            "Escape" => Some(Code::Escape),
+            "Tab" => Some(Code::Tab),
+            "Backspace" => Some(Code::Backspace),
+            "Delete" => Some(Code::Delete),
+            "ArrowUp" => Some(Code::ArrowUp),
+            "ArrowDown" => Some(Code::ArrowDown),
+            "ArrowLeft" => Some(Code::ArrowLeft),
+            "ArrowRight" => Some(Code::ArrowRight),
+            _ => None,
+        };
+    }
+
+    match (code, modifiers) {
+        (Some(c), m) => Some(Shortcut::new(Some(m), c)),
+        _ => None,
+    }
+}
+
+// ─── Todos store helpers ───
+
+fn get_all_todos(app: &tauri::AppHandle) -> Result<Vec<TodoItem>, String> {
+    let store = app.store("todos.json").map_err(|e| e.to_string())?;
+    Ok(store
+        .get("todos")
+        .and_then(|v| serde_json::from_value::<Vec<TodoItem>>(v.clone()).ok())
+        .unwrap_or_default())
+}
+
+fn save_all_todos(app: &tauri::AppHandle, todos: &[TodoItem]) -> Result<(), String> {
+    let store = app.store("todos.json").map_err(|e| e.to_string())?;
+    store.set("todos", serde_json::to_value(todos).map_err(|e| e.to_string())?);
+    store.save().map_err(|e| e.to_string())
+}
+
+// ─── Contexts store helpers ───
+
+fn get_contexts(app: &tauri::AppHandle) -> Result<HashMap<String, Vec<String>>, String> {
+    let store = app.store("contexts.json").map_err(|e| e.to_string())?;
+    Ok(store
+        .get("contexts")
+        .and_then(|v| serde_json::from_value::<HashMap<String, Vec<String>>>(v.clone()).ok())
+        .unwrap_or_default())
+}
+
+fn save_contexts(app: &tauri::AppHandle, ctx: &HashMap<String, Vec<String>>) -> Result<(), String> {
+    let store = app.store("contexts.json").map_err(|e| e.to_string())?;
+    store.set("contexts", serde_json::to_value(ctx).map_err(|e| e.to_string())?);
+    store.save().map_err(|e| e.to_string())
+}
+
+/// Remove a todo ID from all contexts. Cleans up empty context keys.
+fn remove_todo_from_contexts(app: &tauri::AppHandle, todo_id: &str) -> Result<(), String> {
+    let mut ctx = get_contexts(app)?;
+    for ids in ctx.values_mut() {
+        ids.retain(|id| id != todo_id);
+    }
+    // Remove empty context keys
+    ctx.retain(|_, v| !v.is_empty());
+    save_contexts(app, &ctx)
+}
+
+/// Add todo IDs to contexts.
+fn add_contexts(app: &tauri::AppHandle, todo_id: &str, contexts: &[String]) -> Result<(), String> {
+    let mut ctx = get_contexts(app)?;
+    for c in contexts {
+        ctx.entry(c.clone())
+            .or_insert_with(Vec::new)
+            .push(todo_id.to_string());
+    }
+    save_contexts(app, &ctx)
+}
+
+// ─── Python context server ───
+
+const CONTEXT_SERVER_URL: &str = "http://127.0.0.1:8765/classify";
+
+/// Spawn the Python context classifier server as a background process.
+fn spawn_context_server() {
+    use std::process::{Command, Stdio};
+
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("todo_context_server.py");
+
+    // Check if the script exists
+    if !script.exists() {
+        eprintln!("[context] todo_context_server.py not found, skipping context classification");
+        return;
+    }
+
+    // Check if google-genai is installed
+    let pip_check = Command::new("python")
+        .arg("-c")
+        .arg("import google.genai")
+        .output();
+
+    if let Ok(output) = pip_check {
+        if !output.status.success() {
+            eprintln!("[context] google-genai not installed. Run: pip install google-genai");
+            return;
+        }
+    }
+
+    // Start the server in the background
+    let server_proc = Command::new("python")
+        .arg(&script)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    match server_proc {
+        Ok(mut proc) => {
+            // Give the server a moment to start up
+            std::thread::sleep(std::time::Duration::from_millis(500));
+
+            // Check if it's still alive
+            match proc.try_wait() {
+                Ok(Some(status)) => {
+                    eprintln!("[context] server exited with status: {}", status);
+                }
+                _ => {
+                    println!("[context] context classifier server started (pid: {})", proc.id());
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("[context] failed to start context server: {}", e);
+        }
+    }
+}
+
+/// Send todo text to the context server for async classification.
+async fn classify_todo_async(todo_id: String, task: String, app: tauri::AppHandle) {
+    let client = reqwest::Client::new();
+
+    let body = serde_json::json!({ "text": task });
+
+    // Retry up to 3 times with delays (server might not be ready yet)
+    for attempt in 0..3 {
+        match client.post(CONTEXT_SERVER_URL).json(&body).send().await {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(data) => {
+                            if let Some(contexts) = data["contexts"].as_array() {
+                                let labels: Vec<String> = contexts
+                                    .iter()
+                                    .filter_map(|v| v.as_str().map(String::from))
+                                    .collect();
+
+                                if let Err(e) = add_contexts(&app, &todo_id, &labels) {
+                                    eprintln!("[context] failed to save contexts: {}", e);
+                                } else {
+                                    println!("[context] classified todo {}: {:?}", todo_id, labels);
+                                }
+                            }
+                        }
+                        Err(e) => eprintln!("[context] failed to parse response: {}", e),
+                    }
+                    return; // Success, don't retry
+                }
+            }
+            Err(e) => {
+                eprintln!("[context] classify request failed (attempt {}): {}", attempt + 1, e);
+            }
+        }
+
+        // Wait before retrying
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+// ─── Tauri commands for todos ───
+
+/// Add a new todo item to the global todos store and return it.
+/// Spawns an async background task to classify the todo context.
+#[tauri::command]
+async fn add_todo(app: tauri::AppHandle, note_id: String, task: String) -> Result<TodoItem, String> {
+    let mut todos = get_all_todos(&app)?;
+
+    let id = Uuid::new_v4().to_string();
+    let todo = TodoItem {
+        id: id.clone(),
+        task,
+        status: "undone".to_string(),
+    };
+    todos.push(todo.clone());
+    save_all_todos(&app, &todos)?;
+
+    // Add this todo's ID to the note's todo_ids
+    let notes_store = app.store("notes.json").map_err(|e| e.to_string())?;
+    let mut notes: Vec<Note> = notes_store
+        .get("notes")
+        .and_then(|v| serde_json::from_value::<Vec<Note>>(v.clone()).ok())
+        .unwrap_or_default();
+
+    if let Some(note) = notes.iter_mut().find(|n| n.id == note_id) {
+        note.todo_ids.push(todo.id.clone());
+        notes_store
+            .set("notes", serde_json::to_value(&notes).map_err(|e| e.to_string())?);
+        notes_store.save().map_err(|e| e.to_string())?;
+    }
+
+    // Spawn async context classification in the background
+    let app_clone = app.clone();
+    let task_text = todo.task.clone();
+    tauri::async_runtime::spawn(async move {
+        classify_todo_async(id, task_text, app_clone).await;
+    });
+
+    Ok(todo)
+}
+
+/// Toggle a todo's status between "done" and "undone".
+#[tauri::command]
+async fn toggle_todo(app: tauri::AppHandle, todo_id: String) -> Result<(), String> {
+    let mut todos = get_all_todos(&app)?;
+
+    if let Some(todo) = todos.iter_mut().find(|t| t.id == todo_id) {
+        todo.status = if todo.status == "done" { "undone".to_string() } else { "done".to_string() };
+        save_all_todos(&app, &todos)?;
+    }
+
+    Ok(())
+}
+
+/// Delete a todo from the global todos store and remove its ID from all notes.
+/// Also cleans up the todo from contexts.json.
+#[tauri::command]
+async fn delete_todo(app: tauri::AppHandle, todo_id: String) -> Result<(), String> {
+    let mut todos = get_all_todos(&app)?;
+    todos.retain(|t| t.id != todo_id);
+    save_all_todos(&app, &todos)?;
+
+    // Remove this todo's ID from every note that references it
+    let notes_store = app.store("notes.json").map_err(|e| e.to_string())?;
+    let mut notes: Vec<Note> = notes_store
+        .get("notes")
+        .and_then(|v| serde_json::from_value::<Vec<Note>>(v.clone()).ok())
+        .unwrap_or_default();
+
+    for note in &mut notes {
+        note.todo_ids.retain(|id| *id != todo_id);
+    }
+    notes_store
+        .set("notes", serde_json::to_value(&notes).map_err(|e| e.to_string())?);
+    notes_store.save().map_err(|e| e.to_string())?;
+
+    // Remove from contexts.json
+    remove_todo_from_contexts(&app, &todo_id)
+}
+
+/// Delete all todos belonging to a specific note.
+/// Also cleans up all those todos from contexts.json.
+#[tauri::command]
+async fn delete_note_todos(app: tauri::AppHandle, note_id: String) -> Result<(), String> {
+    // Get the note's todo IDs
+    let notes_store = app.store("notes.json").map_err(|e| e.to_string())?;
+    let notes: Vec<Note> = notes_store
+        .get("notes")
+        .and_then(|v| serde_json::from_value::<Vec<Note>>(v.clone()).ok())
+        .unwrap_or_default();
+
+    let todo_ids = notes.iter()
+        .find(|n| n.id == note_id)
+        .map(|n| n.todo_ids.clone())
+        .unwrap_or_default();
+
+    if todo_ids.is_empty() {
+        return Ok(());
+    }
+
+    // Remove those todos from todos.json
+    let mut all_todos = get_all_todos(&app)?;
+    all_todos.retain(|t| !todo_ids.contains(&t.id));
+    save_all_todos(&app, &all_todos)?;
+
+    // Remove each todo from contexts.json
+    for id in &todo_ids {
+        remove_todo_from_contexts(&app, id)?;
+    }
+
+    Ok(())
+}
+
+/// Get all todos for a specific note.
+#[tauri::command]
+async fn get_note_todos(app: tauri::AppHandle, note_id: String) -> Result<Vec<TodoItem>, String> {
+    // Get the note to find its todo IDs
+    let notes_store = app.store("notes.json").map_err(|e| e.to_string())?;
+    let notes: Vec<Note> = notes_store
+        .get("notes")
+        .and_then(|v| serde_json::from_value::<Vec<Note>>(v.clone()).ok())
+        .unwrap_or_default();
+
+    let note = notes.iter().find(|n| n.id == note_id);
+    let todo_ids = note.map(|n| n.todo_ids.clone()).unwrap_or_default();
+
+    // Fetch all todos and filter to just the ones for this note
+    let all_todos = get_all_todos(&app)?;
+    let mut note_todos: Vec<TodoItem> = all_todos
+        .into_iter()
+        .filter(|t| todo_ids.contains(&t.id))
+        .collect();
+
+    // Sort todos in the same order as the note's todo_ids
+    note_todos.sort_by_key(|t| todo_ids.iter().position(|id| id == &t.id).unwrap_or(usize::MAX));
+
+    Ok(note_todos)
+}
+
+// ─── Window spawning ───
+
+/// Spawn a single note WebviewWindow from a Note struct.
+fn spawn_note_window(app: &tauri::AppHandle, note: &Note) {
+    let label = format!("note-{}", note.id);
+
+    // Skip if already exists
+    if app.get_webview_window(&label).is_some() {
+        return;
+    }
+
+    let url = format!("index.html#note-{}", note.id);
+
+    tauri::WebviewWindowBuilder::new(
+        app,
+        &label,
+        tauri::WebviewUrl::App(url.into()),
+    )
+    .title(&note.title)
+    .inner_size(note.width, note.height)
+    .position(note.x, note.y)
+    .resizable(true)
+    .decorations(false)
+    .always_on_top(true)
+    .build()
+    .ok();
+}
+
+/// Spawn WebviewWindows for all saved notes on app launch.
+fn spawn_notes_on_launch(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    let store = app.store("notes.json")?;
+    let notes: Vec<Note> = store
+        .get("notes")
+        .and_then(|v| serde_json::from_value::<Vec<Note>>(v.clone()).ok())
+        .unwrap_or_default();
+
+    for note in &notes {
+        spawn_note_window(app, note);
+    }
+
+    Ok(())
+}
+
+/// Tauri command: spawn (or focus) the Preferences window.
+#[tauri::command]
+async fn spawn_preferences_window(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window("preferences") {
+        win.show().map_err(|e| e.to_string())?;
+        win.set_focus().map_err(|e| e.to_string())?;
+        return Ok(());
+    }
+
+    tauri::WebviewWindowBuilder::new(
+        &app,
+        "preferences",
+        tauri::WebviewUrl::App("index.html#preferences".into()),
+    )
+    .title("Preferences")
+    .inner_size(420.0, 320.0)
+    .resizable(false)
+    .decorations(true)
+    .build()
+    .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Tauri command: create a new note, persist it, and spawn its window.
+#[tauri::command]
+async fn create_note(app: tauri::AppHandle) -> Result<Note, String> {
+    let store = app.store("notes.json").map_err(|e| e.to_string())?;
+
+    let mut notes: Vec<Note> = store
+        .get("notes")
+        .and_then(|v| serde_json::from_value::<Vec<Note>>(v.clone()).ok())
+        .unwrap_or_default();
+
+    // Position the note randomly within the safe center region
+    // (20% margins from all four edges)
+    let (screen_w, screen_h) = match app.primary_monitor() {
+        Ok(Some(monitor)) => {
+            let size = monitor.size();
+            let scale = monitor.scale_factor();
+            (size.width as f64 / scale, size.height as f64 / scale)
+        }
+        _ => (1920.0, 1080.0), // fallback
+    };
+
+    // Safe zone: 20% margin on all sides
+    let margin_w = screen_w * 0.2;
+    let margin_h = screen_h * 0.2;
+    let safe_w = (screen_w * 0.6 - 300.0).max(0.0);
+    let safe_h = (screen_h * 0.6 - 200.0).max(0.0);
+
+    const NOTE_COLORS: [&str; 6] = [
+        "#FFE066", // Yellow
+        "#A8E6A1", // Green
+        "#87CEEB", // Blue
+        "#FFB3C1", // Pink
+        "#FFD4A1", // Orange
+        "#D4B8E8", // Purple
+    ];
+
+    // Use UUID bytes as random seed for positioning and color
+    let uuid = Uuid::new_v4();
+    let id = uuid.to_string();
+    let uuid_val = uuid.as_u128();
+    let x = margin_w + (uuid_val as f64 % 1000.0) / 1000.0 * safe_w;
+    let y = margin_h + (((uuid_val >> 32) as f64 % 1000.0) / 1000.0) * safe_h;
+    // Pick random color from the palette
+    let color_idx = (uuid_val >> 48) as usize % NOTE_COLORS.len();
+    let color = NOTE_COLORS[color_idx].to_string();
+
+    let note = Note {
+        id,
+        title: "ToDo".to_string(),
+        x: x.max(0.0),
+        y: y.max(0.0),
+        width: 300.0,
+        height: 200.0,
+        color,
+        todo_ids: Vec::new(),
+    };
+
+    notes.push(note.clone());
+    let notes_value = serde_json::to_value(&notes).unwrap();
+    store.set("notes", notes_value);
+    store.save().map_err(|e| e.to_string())?;
+
+    spawn_note_window(&app, &note);
+
+    // New notes are visible, so set the visibility state to true
+    if let Some(state) = app.try_state::<NotesVisibility>() {
+        *state.notes_visible.lock().expect("poisoned lock") = true;
+    }
+
+    Ok(note)
+}
+
+/// Tauri command: re-register the global shortcut with a new hotkey string.
+#[tauri::command]
+async fn re_register_shortcut(
+    app: tauri::AppHandle,
+    new_hotkey: String,
+) -> Result<(), String> {
+    let shortcut = parse_hotkey_string(&new_hotkey)
+        .ok_or_else(|| format!("Invalid hotkey: {}", new_hotkey))?;
+
+    // Unregister the previously registered shortcut (if any)
+    if let Some(state) = app.try_state::<GlobalShortcutState>() {
+        let guard = state.current.lock().map_err(|e| e.to_string())?;
+        if let Some(old) = guard.as_ref() {
+            app.global_shortcut()
+                .unregister(old.clone())
+                .map_err(|e| e.to_string())?;
+        }
+    }
+
+    // Register the new shortcut
+    let toggle_closure = shortcut.clone();
+    app.global_shortcut()
+        .on_shortcut(shortcut.clone(), move |app_handle, _shortcut, event| {
+            if event.state == ShortcutState::Pressed {
+                toggle_note_windows(app_handle);
+            }
+        })
+        .map_err(|e| e.to_string())?;
+
+    // Update tracked state
+    if let Some(state) = app.try_state::<GlobalShortcutState>() {
+        let mut guard = state.current.lock().map_err(|e| e.to_string())?;
+        *guard = Some(toggle_closure);
+    }
+
+    // Persist to store
+    let store = app.store("notes.json").map_err(|e| e.to_string())?;
+    store.set("hotkey", new_hotkey);
+    store.save().map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+/// Called when a note window is being hidden (✕) or destroyed (🗑).
+/// For close: `hide()` already ran, so `is_visible()` returns false for this window.
+/// For delete: `destroy()` hasn't run yet, so this window is still counted as visible.
+///
+/// visible_count == 0 → last note was closed, no notes remain visible → flip toggle
+/// visible_count == 1 → either deleting the last note (self still visible) or closing
+///   the only visible note → flip toggle in both cases
+#[tauri::command]
+async fn note_hidden(app: tauri::AppHandle, is_destroying: bool) {
+    let visible_count = app.webview_windows().iter().filter(|(label, _)| {
+        label.starts_with("note-")
+            && app
+                .get_webview_window(label)
+                .is_some_and(|w| w.is_visible().unwrap_or(false))
+    }).count();
+
+    let should_flip = if is_destroying {
+        visible_count <= 1  // only self visible, no others
+    } else {
+        visible_count == 0  // no notes visible at all
+    };
+
+    if should_flip {
+        if let Some(state) = app.try_state::<NotesVisibility>() {
+            *state.notes_visible.lock().expect("poisoned lock") = false;
+        }
+    }
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_store::Builder::default().build())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        .on_window_event(|_window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                _window.hide().ok();
+            }
+        })
+        .setup(|app| {
+            // --- Initialize store ---
+            let store = app.store("notes.json")?;
+            if store.get("notes").is_none() {
+                store.set("notes", serde_json::json!([]));
+                store.save()?;
+            }
+
+            // Initialize todos store
+            let todos_store = app.store("todos.json")?;
+            if todos_store.get("todos").is_none() {
+                todos_store.set("todos", serde_json::json!([]));
+                todos_store.save()?;
+            }
+
+            // Initialize contexts store
+            let ctx_store = app.store("contexts.json")?;
+            if ctx_store.get("contexts").is_none() {
+                ctx_store.set("contexts", serde_json::json!({}));
+                ctx_store.save()?;
+            }
+
+            // Spawn the Python context classifier server
+            spawn_context_server();
+
+            // Check if notes exist and are non-empty; create a default note if not.
+            let needs_default = match store.get("notes") {
+                None => true,
+                Some(v) => v.as_array().map_or(true, |a| a.is_empty()),
+            };
+
+            if needs_default {
+                let default_note = Note {
+                    id: Uuid::new_v4().to_string(),
+                    title: "ToDo".to_string(),
+                    x: 100.0,
+                    y: 100.0,
+                    width: 300.0,
+                    height: 200.0,
+                    color: "#FFE066".to_string(),
+                    todo_ids: Vec::new(),
+                };
+                store.set("notes", serde_json::json!([default_note]));
+                store.save()?;
+                // Spawn the default note window immediately
+                spawn_note_window(&app.handle(), &default_note);
+            }
+
+            // --- Restore notes on launch ---
+            spawn_notes_on_launch(app.handle()).ok();
+
+            // --- Register global shortcut ---
+            let default_hotkey =
+                Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyS);
+
+            let hotkey = {
+                let store = app.store("notes.json")?;
+                store
+                    .get("hotkey")
+                    .and_then(|v| v.as_str().map(|s| s.to_string()))
+                    .and_then(|s| parse_hotkey_string(&s))
+                    .unwrap_or(default_hotkey)
+            };
+
+            let tracked_shortcut = hotkey.clone();
+            app.global_shortcut()
+                .on_shortcut(hotkey.clone(), |app_handle, _shortcut, event| {
+                    if event.state == ShortcutState::Pressed {
+                        toggle_note_windows(app_handle);
+                    }
+                })
+                .map_err(|e| e.to_string())?;
+
+            // Store the initial shortcut in state for later re-registration
+            app.manage(GlobalShortcutState {
+                current: Mutex::new(Some(tracked_shortcut)),
+            });
+
+            // Initialize notes visibility tracking (true = notes are shown)
+            app.manage(NotesVisibility {
+                notes_visible: Mutex::new(true),
+            });
+
+            // --- Tray icon & menu ---
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &MenuItemBuilder::with_id("show_notes", "Show Notes").build(app)?,
+                    &MenuItemBuilder::with_id("preferences", "Preferences").build(app)?,
+                    &PredefinedMenuItem::separator(app)?,
+                    &PredefinedMenuItem::quit(app, None)?,
+                ],
+            )?;
+
+            TrayIconBuilder::with_id("tray")
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("Sticky Notes")
+                .menu(&menu)
+                .show_menu_on_left_click(true)
+                .on_tray_icon_event(|tray, event| {
+                    if let TrayIconEvent::Click {
+                        button: MouseButton::Left,
+                        ..
+                    } = event
+                    {
+                        toggle_note_windows(tray.app_handle());
+                    }
+                })
+                .build(app)?;
+
+            // --- Tray menu event handler ---
+            app.on_menu_event(|app, event| {
+                match event.id().as_ref() {
+                    "show_notes" => {
+                        // Toggle notes via the same logic as the hotkey
+                        toggle_note_windows(app);
+                    }
+                    "preferences" => {
+                        let app = app.clone();
+                        tauri::async_runtime::spawn(async move {
+                            let _ = spawn_preferences_window(app).await;
+                        });
+                    }
+                    "quit" => {
+                        app.exit(0);
+                    }
+                    _ => {}
+                }
+            });
+
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            spawn_preferences_window,
+            create_note,
+            re_register_shortcut,
+            note_hidden,
+            add_todo,
+            toggle_todo,
+            delete_todo,
+            delete_note_todos,
+            get_note_todos
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}
