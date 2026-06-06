@@ -11,7 +11,9 @@ Endpoints:
 
 import json
 import sys
+import os
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from dotenv import load_dotenv
 
 try:
     from google import genai
@@ -19,11 +21,18 @@ except ImportError:
     print("ERROR: google-genai not installed. Run: pip install google-genai", file=sys.stderr)
     sys.exit(1)
 
+# ─── LOAD .ENV ─────────────────────────────────────────────────────────
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
 # ─── CONFIG ────────────────────────────────────────────────────────────
 HOST = "127.0.0.1"
 PORT = 8765
-API_KEY = ""  # Replace with your actual API key
+API_KEY = os.environ.get("GEMINI_API_KEY", "")
 MODEL = "gemini-3.1-flash-lite"
+
+if not API_KEY:
+    print("ERROR: GEMINI_API_KEY not set. Add it to src-tauri/.env", file=sys.stderr)
+    sys.exit(1)
 
 client = genai.Client(api_key=API_KEY)
 
