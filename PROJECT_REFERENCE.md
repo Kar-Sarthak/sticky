@@ -41,8 +41,11 @@ Notes persist position, size, title, color, and todo references across restarts 
 | Store persistence | tauri-plugin-store | 2.4.3 |
 | Global shortcut | tauri-plugin-global-shortcut | 2.3.2 |
 | UUID generation | uuid | ^1 (v4) |
+| HTTP client | reqwest | ^0.12 |
+| Async runtime | tokio | ^1 |
 | Fonts | Permanent Marker (Google Fonts) | — |
 | Platform | Windows 11 (primary target) | — |
+| AI context classification | google-genai (Python) | gemini-3.1-flash-lite |
 
 ### Key Rust Dependencies (`src-tauri/Cargo.toml`)
 
@@ -53,6 +56,8 @@ tauri-plugin-global-shortcut = "2.3.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["rt"] }
 ```
 
 ### Key npm Dependencies (`package.json`)
@@ -91,12 +96,13 @@ e:\sticky\
 │   ├── Cargo.toml                        # Rust dependencies
 │   ├── tauri.conf.json                   # Tauri config (no main window, background-only)
 │   ├── build.rs                          # Standard Tauri build script
+│   ├── todo_context_server.py            # Python HTTP server for AI context classification (Gemini API)
 │   ├── capabilities/
 │   │   └── default.json                  # Permissions for all windows
 │   ├── icons/                            # Generated app/tray icons
 │   └── src/
 │       ├── main.rs                       # Entry point → calls lib::run()
-│       ├── lib.rs                        # ALL Rust logic: setup, tray, hotkey, todo commands, window spawning
+│       ├── lib.rs                        # ALL Rust logic: setup, tray, hotkey, todo/context commands, window spawning
 │       └── models.rs                     # Note + TodoItem structs (Rust side, shared via serde)
 ```
 
@@ -181,6 +187,19 @@ All data is stored in the Tauri app data directory:
 }
 ```
 
+**`contexts.json`** — Context classification: maps context labels → todo IDs
+```json
+{
+  "contexts": {
+    "gmail": ["uuid-b", "uuid-d"],
+    "shopping": ["uuid-a"],
+    "vscode": ["uuid-c"]
+  }
+}
+```
+
+Populated asynchronously by the Python context classifier server. When a new todo is created, its text is sent to the Gemini LLM which returns context labels (e.g., `["gmail", "calendar"]`). Those labels and the todo ID are saved to `contexts.json`.
+
 **Store file location (Windows):** `%APPDATA%\com.sticky-notes.app\`
 
 ---
@@ -198,6 +217,12 @@ All data is stored in the Tauri app data directory:
 - `parse_hotkey_string(s)` — Parses strings like "CommandOrControl+Shift+S" into a `Shortcut`. Supports A-Z, F1-F12, Space, Enter, Escape, Tab, Backspace, Delete, Arrow keys
 - `get_all_todos(app)` → `Result<Vec<TodoItem>>` — reads all todos from `todos.json`
 - `save_all_todos(app, todos)` → `Result<()>` — writes all todos to `todos.json`
+- `get_contexts(app)` → `Result<HashMap<String, Vec<String>>>` — reads context mapping from `contexts.json`
+- `save_contexts(app, ctx)` → `Result<()>` — writes context mapping to `contexts.json`
+- `remove_todo_from_contexts(app, todo_id)` → `Result<()>` — removes a todo ID from all contexts, cleans up empty context keys
+- `add_contexts(app, todo_id, contexts)` → `Result<()>` — adds todo IDs to context labels in `contexts.json`
+- `spawn_context_server()` — Spawns `todo_context_server.py` as a detached background subprocess (stdio → null) at app startup. Checks if script exists and `google-genai` is installed first.
+- `classify_todo_async(todo_id, task, app)` — Sends todo text to the Python server via HTTP POST, retries up to 3 times with 500ms delays, saves returned context labels to `contexts.json`
 - `spawn_note_window(app, note)` — Creates a `WebviewWindow` with label `note-{id}`, loads `index.html#note-{id}`, sets `decorations: false`, `always_on_top: true`, `resizable: true`, with saved position/size
 - `spawn_notes_on_launch(app)` — Reads all notes from store, calls `spawn_note_window` for each
 
@@ -206,22 +231,24 @@ All data is stored in the Tauri app data directory:
 - `create_note(app)` — Generates a new Note with random position (20% safe zone margins), random color from 6-note palette, empty `todo_ids`, persists to store, spawns window, sets `NotesVisibility = true`
 - `re_register_shortcut(app, new_hotkey)` — Unregisters old shortcut via `GlobalShortcutState`, parses new one, registers it, persists to store
 - `note_hidden(app, is_destroying)` — Called when a note is closed (hide) or deleted (destroy). Checks visible note window count. If 0 remain visible (close) or only self was visible (destroy), sets `NotesVisibility = false`
-- `add_todo(app, note_id, task)` — Creates a TodoItem in `todos.json`, adds its ID to the note's `todo_ids` in `notes.json`
+- `add_todo(app, note_id, task)` — Creates a TodoItem in `todos.json`, adds its ID to the note's `todo_ids` in `notes.json`. **Also spawns `classify_todo_async` in background** for AI context classification
 - `toggle_todo(app, todo_id)` — Flips status between "done" and "undone"
-- `delete_todo(app, todo_id)` — Removes todo from `todos.json` AND removes its ID from all notes' `todo_ids`
-- `delete_note_todos(app, note_id)` — Removes ALL todos belonging to a specific note from `todos.json`
+- `delete_todo(app, todo_id)` — Removes todo from `todos.json`, removes its ID from all notes' `todo_ids`, **and removes it from `contexts.json`**
+- `delete_note_todos(app, note_id)` — Removes ALL todos belonging to a specific note from `todos.json` **and from `contexts.json`**
 - `get_note_todos(app, note_id)` — Returns todos for a specific note, ordered by the note's `todo_ids` array
 
 **`setup()` hook (app initialization):**
 1. Initialize `notes.json` (create default yellow note if empty)
 2. Initialize `todos.json` (create empty array if not exists)
-3. Restore all saved notes → spawn windows
-4. Parse hotkey from store (default: Ctrl+Shift+S), register global shortcut
-5. Create `GlobalShortcutState` and `NotesVisibility` managed state
-6. Build system tray with menu: "Show Notes", "Preferences", separator, "Quit"
-7. Left-click tray icon toggles note visibility
-8. Tray menu handlers: "Show Notes" → toggle, "Preferences" → spawn window, "Quit" → exit
-9. Register all 8 Tauri commands
+3. Initialize `contexts.json` (create empty object if not exists)
+4. **Spawn Python context classifier server** (`todo_context_server.py`)
+5. Restore all saved notes → spawn windows
+6. Parse hotkey from store (default: Ctrl+Shift+S), register global shortcut
+7. Create `GlobalShortcutState` and `NotesVisibility` managed state
+8. Build system tray with menu: "Show Notes", "Preferences", separator, "Quit"
+9. Left-click tray icon toggles note visibility
+10. Tray menu handlers: "Show Notes" → toggle, "Preferences" → spawn window, "Quit" → exit
+11. Register all 8 Tauri commands
 
 **`on_window_event` — Global close interceptor:**
 - On `CloseRequested`: calls `api.prevent_close()` then `_window.hide()` — notes hide instead of closing the app
@@ -238,6 +265,27 @@ fn main() {
 ### `src-tauri/src/models.rs`
 
 Contains `Note` and `TodoItem` structs with `serde` derives. Shared between Rust and TypeScript.
+
+### `src-tauri/todo_context_server.py`
+
+Python HTTP server that classifies todo text into app/website contexts using Google's Gemini API.
+
+**Runs on:** `localhost:8765`
+**Endpoints:**
+- `POST /classify` — Body: `{"text": "task description"}` → Response: `{"contexts": ["gmail", "calendar"]}`
+- `GET /health` — Response: `{"status": "ok"}`
+
+**Dependencies:** `pip install google-genai`
+**API key:** Set `API_KEY` variable at the top of the file.
+
+**How it works:**
+1. Spawns at app startup via Rust's `spawn_context_server()`
+2. Runs as a detached subprocess (stdio → null, so it survives the Rust process)
+3. Receives todo text via HTTP POST, sends it to Gemini 3.1 Flash Lite
+4. Gemini returns context labels (specific app/website names)
+5. Rust receives the response and saves contexts to `contexts.json`
+
+**Design note:** Uses `Stdio::null()` for stdout/stderr — if pipes were used, the server would crash when Rust drops the pipe file descriptors.
 
 ### `src-tauri/capabilities/default.json`
 
@@ -278,9 +326,9 @@ Detects window label or URL hash and mounts the correct React component:
 **Key behaviors:**
 - **Title editing:** Click once → `onMouseDown` sets `contenteditable="true"` and selects all. Blur or Enter saves to store. Enter prevents newline
 - **Color picker:** Click the color dot button → horizontal row of 6 color swatches appears to the right. Title is hidden while picker is open. Click a swatch → changes note color, saves to store, closes picker
-- **Add todo:** Type in input at bottom, press Enter → calls `add_todo` (Rust), which creates todo in `todos.json` and adds ID to note's `todo_ids`. Input clears and refocuses for quick entry
+- **Add todo:** Type in input at bottom, press Enter → calls `add_todo` (Rust), which creates todo in `todos.json` and adds ID to note's `todo_ids`. **Background:** todo text is sent to Python context server for AI classification; contexts are saved to `contexts.json` asynchronously (todo appears instantly)
 - **Toggle todo:** Click checkbox → calls `toggle_todo` (Rust), flips status, re-renders with strikethrough for done items
-- **Delete todo:** Hover a todo → ✕ button appears on right. Click → calls `delete_todo` (Rust), removes from `todos.json` and removes ID from note
+- **Delete todo:** Hover a todo → ✕ button appears on right. Click → calls `delete_todo` (Rust), removes from `todos.json`, removes ID from note, **and removes from `contexts.json`**
 - **Position/size sync:** Listens to `onMoved` and `onResized` Tauri events
 - **Drag:** Grip dots on left call `getCurrentWindow().startDragging()` on mousedown
 - **Close (✕):** Hides the window, calls `note_hidden` with `isDestroying: false`
@@ -358,7 +406,8 @@ Links Google Fonts: `Permanent Marker` (handwritten font).
 - **Add todo** — Input at bottom, Enter creates new todo (saved globally + linked by ID)
 - **Checkbox toggle** — Done/undone with strikethrough styling
 - **Delete todo** — Hover-reveal ✕ button on each todo
-- **Todo cleanup on note delete** — Deleting a note also deletes all its todos from `todos.json`
+- **Todo cleanup on note delete** — Deleting a note also deletes all its todos from `todos.json` **and removes their IDs from `contexts.json`**
+- **AI context classification** — Every new todo is sent to Gemini AI (via Python server) which predicts the app/website context (e.g., "gmail", "linkedin", "vscode"). Contexts saved asynchronously to `contexts.json`. Todo appears instantly — classification happens in background
 - **Delete protection** — Cannot delete the last note (button disabled)
 - **Scroll indicators** — Subtle top/bottom fade gradients appear when todo list overflows
 - **Ruled paper lines** — Horizontal rule line separators between todos
@@ -403,6 +452,12 @@ Each todo row: `[☐]` checkbox + todo text + [✕ delete on hover]
 - Done items: `[✓]` checkbox + ~~strikethrough text~~ (faded)
 - Bottom row: `[+]` "Add a todo..." input
 
+### Context Classification Flow
+1. User types todo text → presses Enter
+2. Todo appears instantly in the list
+3. Background task sends text to Python server (`localhost:8765/classify`)
+4. Gemini returns context labels → saved to `contexts.json`
+
 ---
 
 ## 8. Key Architecture Decisions
@@ -413,16 +468,27 @@ Each note gets its own Tauri `WebviewWindow` with a unique label (`note-{uuid}`)
 - Each note can be individually hidden/shown/destroyed
 - Native window events (move, resize, close) per note
 
-### Two-Store Architecture
-Notes and todos are stored in separate files:
+### Three-Store Architecture
+Notes, todos, and contexts are stored in three separate files:
 - **`notes.json`** — Note metadata + ordered `todo_ids` arrays. Light, fast to read.
-- **`todos.json`** — All todo data globally. Single source of truth.
+- **`todos.json`** — All todo data globally (task text, status). Single source of truth.
+- **`contexts.json`** — Context classification mapping: `{"gmail": ["todo-id-1", "todo-id-2"], "vscode": ["todo-id-3"]}`. Used for context-aware todo organization.
 
 This design means:
 - A todo's data (task text, status) lives in one place
 - Notes reference todos by ID (no duplication)
-- Deleting a note can clean up orphaned todos
-- Multiple notes could theoretically share todos (though current UI doesn't support it)
+- Context labels are stored separately from todo data, enabling efficient lookup by context
+- Deleting a note cleans up both `todos.json` and `contexts.json`
+
+### AI Context Classification
+When a new todo is created:
+1. Todo is immediately saved to `todos.json` and appears in the UI
+2. Rust spawns `classify_todo_async` in the background (non-blocking)
+3. The async task sends todo text to the Python HTTP server (`localhost:8765/classify`)
+4. Python server calls Gemini API, returns context labels like `["gmail", "calendar"]`
+5. Rust saves the contexts to `contexts.json`, mapping context → todo ID
+
+The Python server is spawned at app startup as a detached background process. If it fails to start, context classification silently fails and the todo still works normally.
 
 ### Why No Main Window
 `tauri.conf.json` has `"app": { "windows": [] }`. The app process starts in the background. The tray icon is the primary UI for showing/hiding notes and opening Preferences. This matches how sticky note apps work — they live in the background until summoned.
@@ -468,9 +534,24 @@ The `src-tauri/target/` directory grows to ~6GB. Run `cargo clean` in `src-tauri
 ### 9. Store Compatibility
 When the `Note` struct changes (e.g., removing `content` field, adding `todo_ids`), old `notes.json` files become incompatible. Delete the store file to start fresh: `%APPDATA%\com.sticky-notes.app\notes.json`
 
+### 10. Python Context Server
+- Requires `pip install google-genai` and a valid Gemini API key in `todo_context_server.py`
+- Server is spawned at app startup via `Stdio::null()` — it runs as a detached process
+- If the server isn't running, classify requests fail silently (todo still works, just no context labels)
+- The server uses `gemini-3.1-flash-lite` model. Change `MODEL` in the Python file if needed
+
+### 11. Async Classification
+Todo appears instantly — context classification runs in the background. The `classify_todo_async` function retries up to 3 times with 500ms delays in case the Python server hasn't finished starting up yet.
+
 ---
 
-## 10. Build & Run Commands
+### Prerequisites
+```bash
+# Python dependencies (for AI context classification)
+pip install google-genai
+```
+
+### Build & Run Commands
 
 ```bash
 # Install deps (run from project root e:\sticky)
@@ -495,12 +576,14 @@ cd src-tauri && cargo check
 ### Store File Locations
 ```
 # Windows
-%APPDATA%\com.sticky-notes.app\notes.json   ← notes + todo IDs
-%APPDATA%\com.sticky-notes.app\todos.json   ← all todo data
+%APPDATA%\com.sticky-notes.app\notes.json     ← notes + todo IDs
+%APPDATA%\com.sticky-notes.app\todos.json     ← all todo data
+%APPDATA%\com.sticky-notes.app\contexts.json  ← context → todo ID mapping
 
-# To reset everything (delete both stores):
+# To reset everything (delete all stores):
 Remove-Item "$env:APPDATA\com.sticky-notes.app\notes.json" -Force
 Remove-Item "$env:APPDATA\com.sticky-notes.app\todos.json" -Force
+Remove-Item "$env:APPDATA\com.sticky-notes.app\contexts.json" -Force
 ```
 
 ---
