@@ -109,8 +109,171 @@ def get_edge_url(hwnd):
     return None
 
 
+# ─── CONTEXT DETECTION ─────────────────────────────────────────────────
+
+# Context name → URL keywords
+CONTEXT_URL_MAP = {
+    "linkedin":       ["linkedin.com"],
+    "github":         ["github.com"],
+    "gmail":          ["mail.google.com", "gmail.com"],
+    "youtube":        ["youtube.com", "youtu.be"],
+    "leetcode":       ["leetcode.com"],
+    "notion":         ["notion.so", "notion.site"],
+    "chatgpt":        ["chatgpt.com", "chat.openai.com"],
+    "google docs":    ["docs.google.com/document"],
+    "google sheets":  ["docs.google.com/spreadsheets"],
+    "google slides":  ["docs.google.com/presentation"],
+    "google drive":   ["drive.google.com"],
+    "twitter":        ["twitter.com", "x.com"],
+    "instagram":      ["instagram.com"],
+    "reddit":         ["reddit.com"],
+    "stackoverflow":  ["stackoverflow.com"],
+    "trello":         ["trello.com"],
+    "jira":           ["atlassian.net", "jira.com"],
+    "figma":          ["figma.com"],
+    "vercel":         ["vercel.com"],
+    "netlify":        ["netlify.com"],
+    "heroku":         ["heroku.com"],
+    "aws":            ["aws.amazon.com", "console.aws.amazon.com"],
+    "google calendar":["calendar.google.com"],
+    "slack":          ["slack.com"],
+    "discord":        ["discord.com/app"],
+}
+
+# Process name → context name
+CONTEXT_PROCESS_MAP = {
+    "code.exe":             "vscode",
+    "code":                 "vscode",
+    "slack.exe":            "slack",
+    "slack":                "slack",
+    "discord.exe":          "discord",
+    "discord":              "discord",
+    "zoom.exe":             "zoom",
+    "zoom":                 "zoom",
+    "teams.exe":            "microsoft teams",
+    "teams":                "microsoft teams",
+    "outlook.exe":          "outlook",
+    "spotify.exe":          "spotify",
+    "obsidian.exe":         "obsidian",
+    "notion.exe":           "notion",
+    "figma.exe":            "figma",
+    "postman.exe":          "postman",
+    "pycharm64.exe":        "pycharm",
+    "idea64.exe":           "intellij",
+    "webstorm64.exe":       "webstorm",
+    "androidstudio64.exe":  "android studio",
+}
+
+
+def detect_current_contexts(title, process, hwnd):
+    """Returns (list_of_contexts, url) for the current active window."""
+    contexts = set()
+
+    # URL-based contexts (for browsers)
+    url = None
+    if "firefox" in process:
+        url = get_firefox_url(hwnd)
+    elif "chrome" in process:
+        url = get_chrome_url(hwnd)
+    elif "msedge" in process or "edge" in process:
+        url = get_edge_url(hwnd)
+
+    if url:
+        url_lower = url.lower()
+        for context_name, patterns in CONTEXT_URL_MAP.items():
+            for pattern in patterns:
+                if pattern in url_lower:
+                    contexts.add(context_name)
+                    break
+
+    # Process-based contexts
+    for proc_key, ctx_name in CONTEXT_PROCESS_MAP.items():
+        if proc_key in process:
+            contexts.add(ctx_name)
+            break
+
+    return list(contexts), url
+
+
+# ─── TODO MATCHING ─────────────────────────────────────────────────────
+
+# Resolve paths relative to the app data dir where contexts.json/todos.json live
+def _get_app_data_dir():
+    """Find the Tauri app data directory where store files live."""
+    import pathlib
+    # Windows: %APPDATA%\com.sticky-notes.app\
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        store_dir = os.path.join(appdata, "com.sticky-notes.app")
+        if os.path.exists(store_dir):
+            return store_dir
+    return None
+
+
+def load_todos():
+    """Load all todos from todos.json."""
+    store_dir = _get_app_data_dir()
+    if not store_dir:
+        return []
+    path = os.path.join(store_dir, "todos.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("todos", [])
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def load_contexts():
+    """Load context mapping from contexts.json."""
+    store_dir = _get_app_data_dir()
+    if not store_dir:
+        return {}
+    path = os.path.join(store_dir, "contexts.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("contexts", {})
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def get_todos_for_contexts(active_contexts):
+    """Return todos whose contexts overlap with active_contexts."""
+    todos = load_todos()
+    contexts_map = load_contexts()
+
+    if not active_contexts:
+        return []
+
+    active_lower = [c.lower() for c in active_contexts]
+
+    # Build a map of todo_id → list of contexts from contexts.json
+    todo_contexts = {}
+    for context_name, todo_ids in contexts_map.items():
+        for tid in todo_ids:
+            todo_contexts.setdefault(tid, []).append(context_name)
+
+    # Find matching todos
+    matched = []
+    for todo in todos:
+        tid = todo["id"]
+        todo_ctx = todo_contexts.get(tid, [])
+        # Check if any of this todo's contexts match active contexts
+        for tc in todo_ctx:
+            tc_lower = tc.lower()
+            if any(tc_lower in ac or ac in tc_lower for ac in active_lower):
+                # Attach contexts to the todo for display
+                todo_with_ctx = dict(todo)
+                todo_with_ctx["contexts"] = todo_ctx
+                matched.append(todo_with_ctx)
+                break
+
+    return matched
+
+
 def monitor_loop():
-    """Background thread that polls the active window and prints changes."""
+    """Background thread that polls the active window and shows todo reminders."""
     if not HAS_WINDOW_DEPS:
         return
 
@@ -121,6 +284,8 @@ def monitor_loop():
     last_title = None
     last_url = None
     last_process = None
+    last_contexts = []
+    last_todo_ids = []
 
     print("\n🔍 Window monitor active — watching active window...")
 
@@ -132,30 +297,58 @@ def monitor_loop():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # Try to get URL for browsers
-            url = None
-            if "firefox" in process:
-                url = get_firefox_url(hwnd)
-            elif "chrome" in process:
-                url = get_chrome_url(hwnd)
-            elif "msedge" in process or "edge" in process:
-                url = get_edge_url(hwnd)
+            # Detect context (URL + process mapping)
+            active_contexts, url = detect_current_contexts(title, process, hwnd)
 
-            # Only print when something changed
+            # Check if anything changed
             title_changed = title != last_title
             url_changed = url != last_url
             process_changed = process != last_process
+            context_changed = set(active_contexts) != set(last_contexts)
 
+            # Find matching todos
+            matched_todos = get_todos_for_contexts(active_contexts) if active_contexts else []
+            current_todo_ids = [t["id"] for t in matched_todos]
+            todos_changed = current_todo_ids != last_todo_ids
+
+            # Print window info if something changed
             if title_changed or url_changed or process_changed:
                 display_url = f" | URL: {url[:80]}" if url else ""
+                print(f"\n{'─' * 55}", flush=True)
                 print(f"  🪟 [{process}] {title}{display_url}", flush=True)
+
+                if active_contexts:
+                    ctx_str = ", ".join(active_contexts)
+                    print(f"  📍 Context: {ctx_str}", flush=True)
+
+                    if matched_todos:
+                        print(f"  📋 Your todos for this context:", flush=True)
+                        for todo in matched_todos:
+                            done = "✅" if todo.get("status") == "done" else "☐"
+                            task = todo.get("task", "??")
+                            ctx_tags = ", ".join(todo.get("contexts", ["general"]))
+                            print(f"     {done} {task}  [{ctx_tags}]", flush=True)
+                    else:
+                        print(f"  📋 No todos for this context", flush=True)
+
+                print(f"{'─' * 55}\n", flush=True)
 
                 last_title = title
                 last_url = url
                 last_process = process
+                last_contexts = active_contexts
+                last_todo_ids = current_todo_ids
+            elif todos_changed and matched_todos:
+                # Same context but todos changed
+                print(f"  📋 Todo list updated for {', '.join(active_contexts)}:", flush=True)
+                for todo in matched_todos:
+                    done = "✅" if todo.get("status") == "done" else "☐"
+                    task = todo.get("task", "??")
+                    print(f"     {done} {task}", flush=True)
+                print()
+                last_todo_ids = current_todo_ids
 
         except Exception as e:
-            # Don't crash the monitor on a single bad poll
             print(f"  [monitor error] {e}", flush=True)
 
         time.sleep(POLL_INTERVAL)
