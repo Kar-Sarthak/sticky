@@ -766,45 +766,6 @@ async fn check_context_todos_and_slide(app: tauri::AppHandle, contexts: Vec<Stri
     }
 }
 
-/// Slide the reminder window down to on-screen position (animation only).
-fn slide_down_reminder(app: &tauri::AppHandle) {
-    // Stop any ongoing bounce
-    stop_bounce(app);
-
-    // Set flag: window is now down
-    if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
-        state.store(true, Ordering::SeqCst);
-    }
-
-    // Animate in background thread so we don't block HTTP requests
-    let app = app.clone();
-    std::thread::spawn(move || {
-        animate_window_y(&app, REMINDER_OFF_SCREEN_Y, REMINDER_ON_SCREEN_Y);
-    });
-}
-
-#[allow(dead_code)]
-/// Show matching todos in the reminder window — slides down from off-screen.
-/// Kept for future use.
-fn show_reminder(app: &tauri::AppHandle, todos: Vec<serde_json::Value>, context: String) {
-    if let Some(win) = app.get_webview_window("reminder") {
-        // Filter out done todos on Rust side as well
-        let undone: Vec<&serde_json::Value> = todos.iter()
-            .filter(|t| t.get("status").and_then(|s| s.as_str()) != Some("done"))
-            .collect();
-
-        if undone.is_empty() {
-            // All todos are done — clear reminder instead
-            clear_reminder(app, true);
-            return;
-        }
-
-        let payload = serde_json::json!({ "todos": undone, "context": context });
-        win.emit("reminder-data", payload).ok();
-        slide_down_reminder(app);
-    }
-}
-
 /// Clear the reminder window — slides back up off-screen.
 /// `clear_todos` — true when there are genuinely no todos left (clears the peek flag).
 ///                  false for temporary slide-ups like mouse-leave (preserves the peek flag).
@@ -994,30 +955,18 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
         return;
     }
 
-    // Handle /slide-down: slide window down to on-screen (animation only)
+    // Handle /slide-down: slide window down to y=-1 (animation only, no data)
     if request.method() == &Method::Post && request.url() == "/slide-down" {
+        stop_bounce(&app);
+        // Set visibility flag
+        if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
+            state.store(true, Ordering::SeqCst);
+        }
         let app = app.clone();
         std::thread::spawn(move || {
-            slide_down_reminder(&app);
+            animate_window_y(&app, REMINDER_OFF_SCREEN_Y, REMINDER_ON_SCREEN_Y);
         });
         let resp_body = Cursor::new(b"{\"status\":\"sliding-down\"}");
-        let _ = request.respond(Response::new(
-            tiny_http::StatusCode(200),
-            Vec::new(),
-            resp_body,
-            None,
-            None,
-        ));
-        return;
-    }
-
-    // Handle /bounce: continuous bounce animation (Y: -250 ↔ -220)
-    if request.method() == &Method::Post && request.url() == "/bounce" {
-        let app = app.clone();
-        std::thread::spawn(move || {
-            start_bounce(&app);
-        });
-        let resp_body = Cursor::new(b"{\"status\":\"bouncing\"}");
         let _ = request.respond(Response::new(
             tiny_http::StatusCode(200),
             Vec::new(),

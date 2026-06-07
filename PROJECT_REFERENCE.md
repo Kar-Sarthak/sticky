@@ -237,9 +237,7 @@ Populated asynchronously by the Python context classifier server. When a new tod
 - `spawn_notes_on_launch(app)` — Reads all notes from store, calls `spawn_note_window` for each
 - `spawn_reminder_window(app)` — Creates the reminder window at startup, positioned off-screen (y = -250). **After build, explicitly calls `set_position()` again to override any OS position clamping.**
 - `animate_window_y(app, from_y, to_y)` — Animates reminder window Y position in 20 steps with ease-out cubic easing (~300ms total). Runs in a separate background thread.
-- `show_reminder(app, todos, context)` — [Kept for future use, currently unused] Sets flag, sends todo data, spawns slide-down animation thread
 - `clear_reminder(app, clear_todos)` — Slides reminder up. If `clear_todos=true`: always runs, clears frontend data, clears peek flag (used by context change / `/slide-up`). If `clear_todos=false`: only runs if window is down, preserves frontend data and peek flag (used by mouse-leave / `/hover-hide`)
-- `slide_down_reminder(app)` — Stops bounce, sets visibility flag, spawns slide-down animation thread
 - `start_bounce(app)` — Sets visibility flag, starts a continuous bounce loop (Y: -250 ↔ -220) in a background thread
 - `stop_bounce(app)` — Sets bounce loop state to 0, causing the thread to break
 - `start_reminder_http_server(app)` — Starts `tiny_http` on port 8766 to receive reminder requests from Python monitor
@@ -259,8 +257,7 @@ Populated asynchronously by the Python context classifier server. When a new tod
 **Reminder HTTP endpoints (port 8766):**
 - `POST /remind` — Receives todos from Python, emits `reminder-data` to frontend, starts bounce animation
 - `POST /slide-up` — Slides reminder up, clears frontend data (used by Python monitor on context change)
-- `POST /slide-down` — Slides reminder down (animation only, no data)
-- `POST /bounce` — Starts continuous bounce loop (Y: -250 ↔ -220)
+- `POST /slide-down` — Slides reminder down to y=-1 (animation only, no data, called by frontend on hover)
 - `POST /hover-hide` — Slides reminder up but preserves frontend data and peek flag (used by frontend on mouse-leave)
 
 **`setup()` hook (app initialization):**
@@ -360,8 +357,7 @@ A lightweight `tiny_http` server running inside the Tauri app that receives remi
 **Endpoints:**
 - `POST /remind` — Body: `{"todos": [...], "context": "..."}` → Sends todo data to reminder window via event, starts bounce animation (Y: -250 ↔ -220)
 - `POST /slide-up` — Slides window up to -250, clears frontend todo data (called by Python monitor on context change)
-- `POST /slide-down` — Slides window down to y = -1 (animation only, no data)
-- `POST /bounce` — Starts continuous bounce animation (Y: -250 ↔ -220)
+- `POST /slide-down` — Slides window down to y=-1 (animation only, called by frontend on hover)
 - `POST /hover-hide` — Slides window up, then peeks at y = -190 (bottom 10px visible). Preserves frontend todo data (called by frontend on mouse-leave)
 
 **Animation system:**
@@ -374,7 +370,6 @@ A lightweight `tiny_http` server running inside the Tauri app that receives remi
 - `Arc<AtomicBool>` — visibility flag (`true` = window is down/visible, `false` = up/off-screen)
 - `Arc<AtomicU8>` — bounce loop flag (`1` = bouncing, `0` = not)
 - `Arc<ReminderHasTodos>` — peek flag (`true` = has todos loaded, controls peek-after-hover-hide behavior)
-- `slide_down_reminder()` — stops bounce, sets visibility flag, animates down
 - `clear_reminder(app, clear_todos)` — if `clear_todos=true`: always runs, clears data + peek flag; if `clear_todos=false`: only runs if window is down, preserves data + peek flag
 
 ---
