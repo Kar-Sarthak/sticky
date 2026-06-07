@@ -257,7 +257,7 @@ Populated asynchronously by the Python context classifier server. When a new tod
 **Reminder HTTP endpoints (port 8766):**
 - `POST /remind` — Receives todos from Python, emits `reminder-data` to frontend, starts bounce animation
 - `POST /slide-up` — Slides reminder up, clears frontend data (used by Python monitor on context change)
-- `POST /slide-down` — Slides reminder down to y=-1 (animation only, no data, called by frontend on hover)
+- `POST /slide-down` — Slides reminder down to y=-1 from the **current window Y position** (animation only, no data, called by frontend on hover). Reads current position so peek/bounce windows slide smoothly without jumping.
 - `POST /hover-hide` — Slides reminder up but preserves frontend data and peek flag (used by frontend on mouse-leave)
 
 **`setup()` hook (app initialization):**
@@ -330,13 +330,14 @@ A single persistent reminder window that shows matching todos for the current ac
 - Shows only **undone** todos — completed todos are filtered out
 - Clicking a checkbox marks todo as done (calls `toggle_todo`), then fades out with strikethrough animation
 - Styled identically to note todos (same checkbox, font, ruled lines)
-- `animLockRef` — 400ms debounce guard to prevent rapid slide animations during window movement
+- `animLockRef` — 400ms debounce guard to prevent rapid slide animations. After animation completes, checks `el.matches(':hover')` — if mouse is NOT over the window, fires `/hover-hide` automatically (catches the case where the window slid past the cursor during animation)
 
 **State:**
 - `todos` — array of matching `TodoItem` from the current context
 - `currentContext` — array of context labels for the current window (e.g., `["linkedin"]`)
 - `fadingIds` — Set of todo IDs currently in the fade-out animation
 - `animLockRef` — `useRef<boolean>`, blocks hover events during slide animation
+- `windowRef` — `useRef<HTMLDivElement>`, reference to root element for post-animation hover check (`el.matches(':hover')`)
 
 **Auto slide-up on empty list:**
 - After the 600ms fade-out animation removes a todo, checks if the list is now empty
@@ -357,7 +358,7 @@ A lightweight `tiny_http` server running inside the Tauri app that receives remi
 **Endpoints:**
 - `POST /remind` — Body: `{"todos": [...], "context": "..."}` → Sends todo data to reminder window via event, starts bounce animation (Y: -180 ↔ -150)
 - `POST /slide-up` — Slides window up to -300, clears frontend todo data (called by Python monitor on context change)
-- `POST /slide-down` — Slides window down to y=-1 (animation only, called by frontend on hover)
+- `POST /slide-down` — Slides window down to y=-1 from the **current window Y position** (reads actual position, no jump, called by frontend on hover)
 - `POST /hover-hide` — Slides window up, then peeks at y = -190 (bottom 10px visible). Preserves frontend todo data (called by frontend on mouse-leave)
 
 **Animation system:**

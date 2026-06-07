@@ -968,7 +968,12 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
         }
         let app = app.clone();
         std::thread::spawn(move || {
-            animate_window_y(&app, REMINDER_OFF_SCREEN_Y, REMINDER_ON_SCREEN_Y);
+            if let Some(win) = app.get_webview_window("reminder") {
+                let from_y = win.outer_position()
+                    .map(|p| (p.y as f64).max(REMINDER_OFF_SCREEN_Y))
+                    .unwrap_or(REMINDER_OFF_SCREEN_Y);
+                animate_window_y(&app, from_y, REMINDER_ON_SCREEN_Y);
+            }
         });
         let resp_body = Cursor::new(b"{\"status\":\"sliding-down\"}");
         let _ = request.respond(Response::new(
