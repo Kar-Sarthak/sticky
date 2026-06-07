@@ -663,8 +663,13 @@ async fn note_hidden(app: tauri::AppHandle, is_destroying: bool) {
 
 // ─── Reminder Window ───
 
-/// Off-screen Y position (just above the visible area)
-const REMINDER_OFF_SCREEN_Y: f64 = -250.0;
+/// Off-screen Y position (fully hidden, no shadow visible)
+const REMINDER_OFF_SCREEN_Y: f64 = -300.0;
+/// Bounce base Y: position where the bounce animation hovers (~30px visible at screen edge)
+const REMINDER_BOUNCE_BASE_Y: f64 = -260.0;
+/// Peek Y: position showing bottom 10px of window (window is 200px tall)
+const REMINDER_PEEK_Y: f64 = -240.0;
+
 /// On-screen Y position (visible at top of screen)
 const REMINDER_ON_SCREEN_Y: f64 = -1.0;
 
@@ -816,7 +821,7 @@ fn clear_reminder(app: &tauri::AppHandle, clear_todos: bool) {
             // After sliding up, slide back down to show bottom 10px peek (only if flag is set)
             if peek_val {
                 std::thread::sleep(std::time::Duration::from_millis(350));
-                animate_window_y(&app, REMINDER_OFF_SCREEN_Y, -190.0);
+                animate_window_y(&app, REMINDER_OFF_SCREEN_Y, REMINDER_PEEK_Y);
             }
         }
     });
@@ -857,7 +862,7 @@ fn start_bounce(app: &tauri::AppHandle) {
         let current_pos = win.outer_position().unwrap_or(tauri::PhysicalPosition::new(0, 0));
         let x = current_pos.x;
 
-        let base_y = REMINDER_OFF_SCREEN_Y; // -250
+        let base_y = REMINDER_BOUNCE_BASE_Y;
         let amplitude = 30.0; // bounce 30px down
 
         loop {

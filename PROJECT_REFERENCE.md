@@ -235,10 +235,10 @@ Populated asynchronously by the Python context classifier server. When a new tod
 - `classify_todo_async(todo_id, task, app)` — Sends todo text to the Python server via HTTP POST, retries up to 3 times with 500ms delays, saves returned context labels to `contexts.json`
 - `spawn_note_window(app, note)` — Creates a `WebviewWindow` with label `note-{id}`, loads `index.html#note-{id}`, sets `decorations: false`, `always_on_top: true`, `resizable: true`, with saved position/size
 - `spawn_notes_on_launch(app)` — Reads all notes from store, calls `spawn_note_window` for each
-- `spawn_reminder_window(app)` — Creates the reminder window at startup, positioned off-screen (y = -250). **After build, explicitly calls `set_position()` again to override any OS position clamping.**
+- `spawn_reminder_window(app)` — Creates the reminder window at startup, positioned off-screen (y = -300). **After build, explicitly calls `set_position()` again to override any OS position clamping.**
 - `animate_window_y(app, from_y, to_y)` — Animates reminder window Y position in 20 steps with ease-out cubic easing (~300ms total). Runs in a separate background thread.
 - `clear_reminder(app, clear_todos)` — Slides reminder up. If `clear_todos=true`: always runs, clears frontend data, clears peek flag (used by context change / `/slide-up`). If `clear_todos=false`: only runs if window is down, preserves frontend data and peek flag (used by mouse-leave / `/hover-hide`)
-- `start_bounce(app)` — Sets visibility flag, starts a continuous bounce loop (Y: -250 ↔ -220) in a background thread
+- `start_bounce(app)` — Sets visibility flag, starts a continuous bounce loop (Y: -180 ↔ -150) in a background thread
 - `stop_bounce(app)` — Sets bounce loop state to 0, causing the thread to break
 - `start_reminder_http_server(app)` — Starts `tiny_http` on port 8766 to receive reminder requests from Python monitor
 
@@ -323,8 +323,8 @@ Python server that does two things: (1) classifies todo text into app/website co
 A single persistent reminder window that shows matching todos for the current active window context.
 
 **Behavior:**
-- Spawns at startup, positioned off-screen (y = -250px)
-- **Bounces** (Y: -250 ↔ -220) when matching todos are found for the current context
+- Spawns at startup, positioned off-screen (y = -300px)
+- **Bounces** (Y: -180 ↔ -150) when matching todos are found for the current context
 - **Hover to reveal** — `onMouseEnter` → POST `/slide-down` → window slides down to y = -1 (visible)
 - **Mouse leave** — `onMouseLeave` → POST `/hover-hide` → window slides up, then peeks at y = -190 (bottom 10px visible)
 - Shows only **undone** todos — completed todos are filtered out
@@ -342,7 +342,7 @@ A single persistent reminder window that shows matching todos for the current ac
 - After the 600ms fade-out animation removes a todo, checks if the list is now empty
 - If empty, calls `invoke("check_context_todos_and_slide", { contexts: currentContext })`
 - Rust reads `contexts.json` and `todos.json` to find matching todos for the current context
-- If no undone todos remain for this context, triggers the slide-up animation (clears data, window tucks to -250)
+- If no undone todos remain for this context, triggers the slide-up animation (clears data, window tucks to -300)
 
 **CSS Animations:**
 - `.fading` class: triggers strikethrough + color fade on text, opacity 1→0, slight upward slide
@@ -355,16 +355,16 @@ A single persistent reminder window that shows matching todos for the current ac
 A lightweight `tiny_http` server running inside the Tauri app that receives reminder requests from the Python monitor.
 
 **Endpoints:**
-- `POST /remind` — Body: `{"todos": [...], "context": "..."}` → Sends todo data to reminder window via event, starts bounce animation (Y: -250 ↔ -220)
-- `POST /slide-up` — Slides window up to -250, clears frontend todo data (called by Python monitor on context change)
+- `POST /remind` — Body: `{"todos": [...], "context": "..."}` → Sends todo data to reminder window via event, starts bounce animation (Y: -180 ↔ -150)
+- `POST /slide-up` — Slides window up to -300, clears frontend todo data (called by Python monitor on context change)
 - `POST /slide-down` — Slides window down to y=-1 (animation only, called by frontend on hover)
 - `POST /hover-hide` — Slides window up, then peeks at y = -190 (bottom 10px visible). Preserves frontend todo data (called by frontend on mouse-leave)
 
 **Animation system:**
 - `animate_window_y(app, from_y, to_y)` — Moves window in 20 steps with ease-out cubic easing (15ms per step = ~300ms total)
 - Runs in a **separate background thread** so the HTTP server stays responsive
-- `start_bounce(app)` — Continuous sine-wave bounce loop at ~60fps (Y: -250 ↔ -220, amplitude 30px, ~1s per cycle)
-- Constants: `REMINDER_OFF_SCREEN_Y = -250.0`, `REMINDER_ON_SCREEN_Y = -1.0`
+- `start_bounce(app)` — Continuous sine-wave bounce loop at ~60fps (Y: -180 ↔ -150, amplitude 30px, ~1s per cycle)
+- Constants: `REMINDER_OFF_SCREEN_Y = -300.0` (fully hidden), `REMINDER_BOUNCE_BASE_Y = -180.0` (bounce base), `REMINDER_PEEK_Y = -190.0` (bottom 10px showing), `REMINDER_ON_SCREEN_Y = -1.0` (fully visible)
 
 **State tracking:**
 - `Arc<AtomicBool>` — visibility flag (`true` = window is down/visible, `false` = up/off-screen)
@@ -556,11 +556,11 @@ Links Google Fonts: `Permanent Marker` (handwritten font).
 - **Toggle state sync** — `note_hidden` command ensures the hotkey toggle state stays correct when closing/deleting individual notes
 - **Real-time todo sync** — `todo-updated` event emitted when any todo is toggled, all windows refresh their state
 - **Context-aware reminder** — Single reminder window monitors active window context, bounces when matching undone todos are found
-- **Reminder animations** — Bounce (continuous Y: -250 ↔ -220), slide-down/slide-up with ease-out cubic easing (~300ms), hover to reveal, peek on hover-hide (bottom 10px at y=-190), fade-out with strikethrough when completing todos
+- **Reminder animations** — Bounce (continuous Y: -180 ↔ -150), slide-down/slide-up with ease-out cubic easing (~300ms), hover to reveal, peek on hover-hide (bottom 10px at y=-190), fade-out with strikethrough when completing todos
 - **Hover reveal** — Mouse over reminder slides it down, mouse leave slides it up with peek
 - **Own app filtering** — Reminder ignores focus on our own app's windows (notes, reminder itself)
 - **Auto slide-up on empty list** — When last todo in reminder is cleared, checks `contexts.json`/`todos.json` for remaining undone todos in current context; if none, slides up and tucks fully
-- **Peek behavior** — After hover-hide with todos loaded, window slides up then peeks at y=-190 (bottom 10px). If all todos cleared, fully tucks to -250
+- **Peek behavior** — After hover-hide with todos loaded, window slides up then peeks at y=-190 (bottom 10px). If all todos cleared, fully tucks to -300
 - **Redundant animation prevention** — Reminder state flag (`AtomicBool`) prevents slide-up animation if window is already off-screen (hover-hide only)
 - **Context-set change detection** — Only triggers reminder workflow when context labels change, not on URL/title changes within the same context
 
@@ -606,8 +606,8 @@ Each todo row: `[☐]` checkbox + todo text + [✕ delete on hover]
 4. Gemini returns context labels → saved to `contexts.json`
 
 ### Reminder Window Behavior
-- **Off-screen by default** — Positioned at y = -250px (above the visible screen)
-- **Bounces** — When matching undone todos are found for the current context, window bounces at the screen edge (Y: -250 ↔ -220)
+- **Off-screen by default** — Positioned at y = -300px (fully hidden above the visible screen)
+- **Bounces** — When matching undone todos are found for the current context, window bounces at the screen edge (Y: -180 ↔ -150)
 - **Hover to reveal** — Moving mouse over the window slides it down to y = -1
 - **Mouse leave** — Window slides back up, then peeks at y = -190 (bottom 10px visible)
 - **Slides up (full tuck)** — When context changes with no todos, or all todos are completed
@@ -728,7 +728,7 @@ Three separate state types track reminder behavior:
 The monitor only triggers the reminder workflow when the **set of context labels** changes (e.g., `{"linkedin"}` → `{"github"}`). Navigating between different pages of the same website (e.g., LinkedIn jobs → LinkedIn notifications) does NOT trigger the workflow, preventing unnecessary animations.
 
 ### 16. Auto Slide-Up on Empty List
-When the last todo in the reminder fades out, the frontend calls `check_context_todos_and_slide(contexts)`. Rust reads `contexts.json` to find all todo IDs for the current context, then checks `todos.json` to count how many are undone. If count is 0, it triggers `clear_reminder(app, true)` which clears data, clears the peek flag, and slides to -250.
+When the last todo in the reminder fades out, the frontend calls `check_context_todos_and_slide(contexts)`. Rust reads `contexts.json` to find all todo IDs for the current context, then checks `todos.json` to count how many are undone. If count is 0, it triggers `clear_reminder(app, true)` which clears data, clears the peek flag, and slides to -300.
 
 ### 17. Hover vs Context Slide-Up Separation
 Two different endpoints handle slide-up for different purposes:
@@ -737,10 +737,10 @@ Two different endpoints handle slide-up for different purposes:
 This prevents old todos from persisting on context changes while keeping them during temporary hover-hide.
 
 ### 18. Peek Behavior
-After a hover-hide with todos loaded, the window slides up to -250 then automatically slides back to -190 (showing bottom 10px). The peek flag must be set (todos were loaded). If the user clears all todos via checkbox, the window tucks fully to -250 with no peek.
+After a hover-hide with todos loaded, the window slides up to -300 then automatically slides back to -190 (showing bottom 10px). The peek flag must be set (todos were loaded). If the user clears all todos via checkbox, the window tucks fully to -300 with no peek.
 
 ### 19. Startup Position Override
-Tauri/Windows may clamp negative Y positions to `0` during window creation. After building the reminder window, an explicit `set_position()` call forces it to the off-screen coordinate (-250) to ensure it starts properly hidden.
+Tauri/Windows may clamp negative Y positions to `0` during window creation. After building the reminder window, an explicit `set_position()` call forces it to the off-screen coordinate (-300) to ensure it starts properly hidden.
 
 ---
 
