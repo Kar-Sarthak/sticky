@@ -27,6 +27,8 @@ Each note is a **todo list** — pressing Enter creates a new todo item. Todos a
 
 Notes persist position, size, title, color, and todo references across restarts via `tauri-plugin-store` (JSON files).
 
+A **context-aware reminder window** monitors the active window, matches todos by context (e.g., "github", "gmail"), and slides down from the top of the screen to show matching undone todos for the current window.
+
 ---
 
 ## 2. Tech Stack
@@ -43,6 +45,7 @@ Notes persist position, size, title, color, and todo references across restarts 
 | UUID generation | uuid | ^1 (v4) |
 | HTTP client | reqwest | ^0.12 |
 | Async runtime | tokio | ^1 |
+| HTTP server (Rust) | tiny_http | ^0.12 |
 | Fonts | Permanent Marker (Google Fonts) | — |
 | Platform | Windows 11 (primary target) | — |
 | AI context classification | google-genai (Python) | gemini-3.1-flash-lite |
@@ -58,6 +61,7 @@ serde_json = "1"
 uuid = { version = "1", features = ["v4"] }
 reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["rt"] }
+tiny_http = "0.12"
 ```
 
 ### Key npm Dependencies (`package.json`)
@@ -84,10 +88,12 @@ e:\sticky\
 │   ├── components/
 │   │   ├── NoteWindow.tsx                # Note UI: todo list, checkboxes, grip, color picker
 │   │   ├── PreferencesWindow.tsx         # Preferences UI (hotkey input + save)
+│   │   ├── ReminderWindow.tsx            # Context-aware reminder: slides down with matching todos
 │   │   └── AddButtonWindow.tsx           # Floating + button (unused — add button in note header)
 │   ├── styles/
 │   │   ├── global.css                    # Global resets, Preferences styles, AddButton styles
-│   │   └── note.css                      # Note styles: header, grip, color picker, todo list, checkboxes
+│   │   ├── note.css                      # Note styles: header, grip, color picker, todo list, checkboxes
+│   │   └── reminder.css                  # Reminder window styles: fade animation, checkbox
 │   └── utils/
 │       ├── store.ts                      # Notes store helpers: getNotes, updateNote, deleteNote, etc.
 │       └── spawnWindow.ts                # Frontend spawn helpers (unused — spawning done from Rust)
@@ -96,13 +102,14 @@ e:\sticky\
 │   ├── Cargo.toml                        # Rust dependencies
 │   ├── tauri.conf.json                   # Tauri config (no main window, background-only)
 │   ├── build.rs                          # Standard Tauri build script
-│   ├── todo_context_server.py            # Python HTTP server for AI context classification (Gemini API)
+│   ├── todo_context_server.py            # Python: AI classification + window context monitor
+│   ├── .env                              # Gemini API key (gitignored)
 │   ├── capabilities/
 │   │   └── default.json                  # Permissions for all windows
 │   ├── icons/                            # Generated app/tray icons
 │   └── src/
 │       ├── main.rs                       # Entry point → calls lib::run()
-│       ├── lib.rs                        # ALL Rust logic: setup, tray, hotkey, todo/context commands, window spawning
+│       ├── lib.rs                        # ALL Rust logic: setup, tray, hotkey, todo/reminder commands
 │       └── models.rs                     # Note + TodoItem structs (Rust side, shared via serde)
 ```
 
@@ -157,7 +164,7 @@ export interface TodoItem {
 }
 ```
 
-### Persistence — TWO Store Files
+### Persistence — THREE Store Files
 
 All data is stored in the Tauri app data directory:
 
@@ -225,6 +232,11 @@ Populated asynchronously by the Python context classifier server. When a new tod
 - `classify_todo_async(todo_id, task, app)` — Sends todo text to the Python server via HTTP POST, retries up to 3 times with 500ms delays, saves returned context labels to `contexts.json`
 - `spawn_note_window(app, note)` — Creates a `WebviewWindow` with label `note-{id}`, loads `index.html#note-{id}`, sets `decorations: false`, `always_on_top: true`, `resizable: true`, with saved position/size
 - `spawn_notes_on_launch(app)` — Reads all notes from store, calls `spawn_note_window` for each
+- `spawn_reminder_window(app)` — Creates the reminder window at startup, positioned off-screen (y = -250)
+- `animate_window_y(app, from_y, to_y)` — Animates reminder window Y position in 20 steps with ease-out cubic easing (~300ms total). Runs in a separate background thread.
+- `show_reminder(app, todos, context)` — Sends todo data to reminder window, spawns animation thread to slide down
+- `clear_reminder(app)` — Sends empty data to reminder window, spawns animation thread to slide up
+- `start_reminder_http_server(app)` — Starts `tiny_http` on port 8766 to receive reminder requests from Python monitor
 
 **Tauri commands:**
 - `spawn_preferences_window(app)` — Opens or focuses a 420x320 decorated window with hash `#preferences`
@@ -232,23 +244,29 @@ Populated asynchronously by the Python context classifier server. When a new tod
 - `re_register_shortcut(app, new_hotkey)` — Unregisters old shortcut via `GlobalShortcutState`, parses new one, registers it, persists to store
 - `note_hidden(app, is_destroying)` — Called when a note is closed (hide) or deleted (destroy). Checks visible note window count. If 0 remain visible (close) or only self was visible (destroy), sets `NotesVisibility = false`
 - `add_todo(app, note_id, task)` — Creates a TodoItem in `todos.json`, adds its ID to the note's `todo_ids` in `notes.json`. **Also spawns `classify_todo_async` in background** for AI context classification
-- `toggle_todo(app, todo_id)` — Flips status between "done" and "undone"
+- `toggle_todo(app, todo_id)` — Flips status between "done" and "undone", emits `todo-updated` event to all windows
 - `delete_todo(app, todo_id)` — Removes todo from `todos.json`, removes its ID from all notes' `todo_ids`, **and removes it from `contexts.json`**
 - `delete_note_todos(app, note_id)` — Removes ALL todos belonging to a specific note from `todos.json` **and from `contexts.json`**
 - `get_note_todos(app, note_id)` — Returns todos for a specific note, ordered by the note's `todo_ids` array
+
+**Reminder HTTP endpoints (port 8766):**
+- `POST /remind` — Receives todos from Python, shows reminder window (slide-down animation)
+- `POST /slide-up` — Slides reminder window up off-screen
 
 **`setup()` hook (app initialization):**
 1. Initialize `notes.json` (create default yellow note if empty)
 2. Initialize `todos.json` (create empty array if not exists)
 3. Initialize `contexts.json` (create empty object if not exists)
 4. **Spawn Python context classifier server** (`todo_context_server.py`)
-5. Restore all saved notes → spawn windows
-6. Parse hotkey from store (default: Ctrl+Shift+S), register global shortcut
-7. Create `GlobalShortcutState` and `NotesVisibility` managed state
-8. Build system tray with menu: "Show Notes", "Preferences", separator, "Quit"
-9. Left-click tray icon toggles note visibility
-10. Tray menu handlers: "Show Notes" → toggle, "Preferences" → spawn window, "Quit" → exit
-11. Register all 8 Tauri commands
+5. **Spawn reminder window** (off-screen)
+6. **Start reminder HTTP server** (localhost:8766)
+7. Restore all saved notes → spawn windows
+8. Parse hotkey from store (default: Ctrl+Shift+S), register global shortcut
+9. Create `GlobalShortcutState` and `NotesVisibility` managed state
+10. Build system tray with menu: "Show Notes", "Preferences", separator, "Quit"
+11. Left-click tray icon toggles note visibility
+12. Tray menu handlers: "Show Notes" → toggle, "Preferences" → spawn window, "Quit" → exit
+13. Register all 8 Tauri commands
 
 **`on_window_event` — Global close interceptor:**
 - On `CloseRequested`: calls `api.prevent_close()` then `_window.hide()` — notes hide instead of closing the app
@@ -268,24 +286,106 @@ Contains `Note` and `TodoItem` structs with `serde` derives. Shared between Rust
 
 ### `src-tauri/todo_context_server.py`
 
-Python HTTP server that classifies todo text into app/website contexts using Google's Gemini API.
+Python server that does two things: (1) classifies todo text into app/website contexts via Gemini API, and (2) monitors the active window to show context-aware todo reminders.
 
-**Runs on:** `localhost:8765`
-**Endpoints:**
+**HTTP Server (localhost:8765):**
 - `POST /classify` — Body: `{"text": "task description"}` → Response: `{"contexts": ["gmail", "calendar"]}`
 - `GET /health` — Response: `{"status": "ok"}`
 
-**Dependencies:** `pip install google-genai`
-**API key:** Set `API_KEY` variable at the top of the file.
+**Window Monitor (background thread):**
+- Polls every 1 second to detect the active window (title + process name)
+- For browsers (Firefox/Chrome/Edge), extracts the URL via `uiautomation`
+- Maps process names → contexts (e.g., `code.exe` → `vscode`)
+- Maps URL patterns → contexts (e.g., `github.com` → `github`)
+- **Own app filtering:** Ignores windows from `sticky-notes.exe` so clicking on the reminder doesn't clear it
+- **Reminder workflow on context change:**
+  1. POST to `localhost:8766/slide-up` → reminder window slides up off-screen
+  2. Check for matching undone todos in the new context
+  3. If found: wait 350ms (for slide-up to complete), then POST to `localhost:8766/remind` with todos → reminder slides back down
+  4. If all todos are done: don't send `/remind` (window stays off-screen)
 
-**How it works:**
-1. Spawns at app startup via Rust's `spawn_context_server()`
-2. Runs as a detached subprocess (stdio → null, so it survives the Rust process)
-3. Receives todo text via HTTP POST, sends it to Gemini 3.1 Flash Lite
-4. Gemini returns context labels (specific app/website names)
-5. Rust receives the response and saves contexts to `contexts.json`
+**Dependencies:** `pip install google-genai pywin32 psutil uiautomation python-dotenv`
+**API key:** Read from `src-tauri/.env` via `python-dotenv`.
 
-**Design note:** Uses `Stdio::null()` for stdout/stderr — if pipes were used, the server would crash when Rust drops the pipe file descriptors.
+---
+
+### `src/components/ReminderWindow.tsx` — Context-Aware Reminder
+
+A single persistent reminder window that shows matching todos for the current active window context.
+
+**Behavior:**
+- Spawns at startup, positioned off-screen (y = -250px)
+- Slides down when matching todos are found, slides up when context changes
+- Shows only **undone** todos — completed todos are filtered out
+- Clicking a checkbox marks todo as done (calls `toggle_todo`), then fades out with strikethrough animation
+- Styled identically to note todos (same checkbox, font, ruled lines)
+
+**State:**
+- `todos` — array of matching `TodoItem` from the current context
+- `fadingIds` — Set of todo IDs currently in the fade-out animation
+
+**CSS Animations:**
+- `.fading` class: triggers strikethrough + color fade on text, opacity 1→0, slight upward slide
+- After 600ms, the todo is removed from the list
+
+---
+
+### Reminder HTTP Server (Rust, localhost:8766)
+
+A lightweight `tiny_http` server running inside the Tauri app that receives reminder requests from the Python monitor.
+
+**Endpoints:**
+- `POST /remind` — Body: `{"todos": [...], "context": "..."}` → Sends todo data to reminder window, then animates slide-down
+- `POST /slide-up` — Animates the reminder window sliding up off-screen
+
+**Animation system:**
+- `animate_window_y(app, from_y, to_y)` — Moves window in 20 steps with ease-out cubic easing (15ms per step = ~300ms total)
+- Runs in a **separate background thread** so the HTTP server stays responsive
+- Constants: `REMINDER_OFF_SCREEN_Y = -250.0`, `REMINDER_ON_SCREEN_Y = 10.0`
+
+---
+
+### Context Matching Logic
+
+**`CONTEXT_URL_MAP`** — Maps context names to URL keywords:
+```python
+"linkedin": ["linkedin.com"],
+"github": ["github.com"],
+"gmail": ["mail.google.com", "gmail.com"],
+# ... 20+ contexts
+```
+
+**`CONTEXT_PROCESS_MAP`** — Maps process names to contexts:
+```python
+"code.exe": "vscode",
+"slack.exe": "slack",
+"discord.exe": "discord",
+# ...
+```
+
+**`get_todos_for_contexts(active_contexts)`** — Loads `contexts.json` and `todos.json`, finds todos whose contexts overlap with the active window's contexts (case-insensitive fuzzy matching).
+
+---
+
+---
+
+---
+
+---
+
+---
+
+---
+
+---
+
+---
+
+---
+
+---
+
+---
 
 ### `src-tauri/capabilities/default.json`
 
@@ -309,7 +409,7 @@ Permissions for all windows (`"*"`). Key permissions:
 Detects window label or URL hash and mounts the correct React component:
 - `label.startsWith("note-")` or `hash.startsWith("#note-")` → `NoteWindow`
 - `label === "preferences"` or `hash === "#preferences"` → `PreferencesWindow`
-- `label === "add-button"` or `hash === "#add-button"` → `AddButtonWindow` (unused now)
+- `label === "reminder"` or `hash === "#reminder"` → `ReminderWindow`
 - Fallback → "No UI loaded"
 
 ### `src/components/NoteWindow.tsx` — Main Note UI (Todo List)
@@ -334,6 +434,7 @@ Detects window label or URL hash and mounts the correct React component:
 - **Close (✕):** Hides the window, calls `note_hidden` with `isDestroying: false`
 - **Delete (🗑):** Calls `delete_note_todos` first (cleans up orphaned todos), then `note_hidden`, then `deleteNote`, then destroys window. Disabled when `noteCount <= 1`
 - **New note (+):** Calls `create_note` Rust command
+- **Real-time sync:** Listens for `todo-updated` events from Rust to refresh todos when toggled from another window (e.g., reminder)
 
 ### `src/components/PreferencesWindow.tsx`
 
@@ -373,6 +474,14 @@ Complete note styling:
 - `.btn-todo-delete` — hidden by default, appears on hover at 50% opacity
 - `.todo-new` / `.todo-new-input` — add todo input row
 - `.note-fade-top` / `.note-fade-bottom` — scroll position indicators (6% alpha gradient)
+
+### `src/styles/reminder.css`
+
+Reminder window styling:
+- `.reminder-window` — yellow background (#FFE066), rounded corners, shadow
+- `.reminder-todo-item` — matches note todo styling (checkbox, font, ruled lines)
+- `.reminder-todo-item.fading` — strikethrough + opacity fade animation
+- `.reminder-checkbox` — native checkbox styled with border, checkmark, transitions
 
 ### `src/styles/global.css`
 
@@ -416,6 +525,10 @@ Links Google Fonts: `Permanent Marker` (handwritten font).
 - **Layered shadows** — Inset shadow (paper curl) + outer drop shadows, intensify on hover
 - **Default note on first launch** — Creates a yellow "ToDo" note automatically
 - **Toggle state sync** — `note_hidden` command ensures the hotkey toggle state stays correct when closing/deleting individual notes
+- **Real-time todo sync** — `todo-updated` event emitted when any todo is toggled, all windows refresh their state
+- **Context-aware reminder** — Single reminder window monitors active window context, slides down with matching undone todos, slides up on context change
+- **Reminder animations** — Slide-down/slide-up with ease-out cubic easing (~300ms), fade-out with strikethrough when completing todos
+- **Own app filtering** — Reminder ignores focus on our own app's windows (notes, reminder itself)
 
 ### Not Implemented (removed during development)
 - **Click-through behavior** — Was attempted (Phase 4) but caused drag conflicts, completely removed
@@ -458,6 +571,14 @@ Each todo row: `[☐]` checkbox + todo text + [✕ delete on hover]
 3. Background task sends text to Python server (`localhost:8765/classify`)
 4. Gemini returns context labels → saved to `contexts.json`
 
+### Reminder Window Behavior
+- **Off-screen by default** — Positioned at y = -250px (above the visible screen)
+- **Slides down** — When matching undone todos are found for the current window context
+- **Slides up** — When context changes or no matching todos
+- **Shows only undone** — Completed todos are filtered out
+- **Checkbox action** — Marking done fades out with strikethrough, then disappears
+- **No own-window clearing** — Clicking on the reminder or a note doesn't trigger context change
+
 ---
 
 ## 8. Key Architecture Decisions
@@ -489,6 +610,16 @@ When a new todo is created:
 5. Rust saves the contexts to `contexts.json`, mapping context → todo ID
 
 The Python server is spawned at app startup as a detached background process. If it fails to start, context classification silently fails and the todo still works normally.
+
+### Context Monitoring & Reminder Workflow
+The Python `todo_context_server.py` runs a background monitor thread that:
+1. **Polls** the active window every 1 second (title, process name, URL for browsers)
+2. **Maps** process names and URLs to context labels (e.g., `github.com` → `github`)
+3. **On context change:** Sends `/slide-up` to Rust → reminder slides up off-screen
+4. **Finds matching todos** in the new context via `get_todos_for_contexts()`
+5. **If todos found:** Waits 350ms (for slide-up to complete), then sends `/remind` → reminder slides down
+6. **If all todos done:** Doesn't send `/remind` (window stays off-screen)
+7. **Own app filtering:** Ignores `sticky-notes.exe` so clicking on notes/reminder doesn't trigger context change
 
 ### Why No Main Window
 `tauri.conf.json` has `"app": { "windows": [] }`. The app process starts in the background. The tray icon is the primary UI for showing/hiding notes and opening Preferences. This matches how sticky note apps work — they live in the background until summoned.
@@ -535,27 +666,30 @@ The `src-tauri/target/` directory grows to ~6GB. Run `cargo clean` in `src-tauri
 When the `Note` struct changes (e.g., removing `content` field, adding `todo_ids`), old `notes.json` files become incompatible. Delete the store file to start fresh: `%APPDATA%\com.sticky-notes.app\notes.json`
 
 ### 10. Python Context Server
-- Requires `pip install google-genai` and a valid Gemini API key in `todo_context_server.py`
-- Server is spawned at app startup via `Stdio::null()` — it runs as a detached process
+- Requires `pip install google-genai` and a valid Gemini API key in `src-tauri/.env`
+- Server is spawned at app startup via `Stdio::inherit()` — output goes to the same terminal
 - If the server isn't running, classify requests fail silently (todo still works, just no context labels)
 - The server uses `gemini-3.1-flash-lite` model. Change `MODEL` in the Python file if needed
 
 ### 11. Async Classification
 Todo appears instantly — context classification runs in the background. The `classify_todo_async` function retries up to 3 times with 500ms delays in case the Python server hasn't finished starting up yet.
 
+### 12. Reminder Animation Threading
+The `animate_window_y()` function runs in a **separate background thread** for each call. This prevents the HTTP server from blocking during the 300ms animation. The `time.sleep(0.35)` in Python ensures the slide-up completes before slide-down starts, preventing competing animations.
+
+### 13. Real-Time Todo Sync
+When `toggle_todo` is called, Rust emits a `todo-updated` event. All note windows and the reminder window listen for this event and refresh their todo lists. This ensures checkboxes stay in sync across all windows.
+
 ---
 
-### Prerequisites
-```bash
-# Python dependencies (for AI context classification)
-pip install google-genai
-```
-
-### Build & Run Commands
+## 10. Build & Run Commands
 
 ```bash
 # Install deps (run from project root e:\sticky)
 npm install
+
+# Python dependencies (for AI context classification + window monitoring)
+pip install google-genai pywin32 psutil uiautomation python-dotenv
 
 # Development (hot-reload for frontend + Rust rebuild)
 npm run tauri dev

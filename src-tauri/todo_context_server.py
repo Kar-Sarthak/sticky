@@ -287,6 +287,7 @@ def monitor_loop():
     import urllib.request
 
     REMINDER_URL = "http://127.0.0.1:8766/remind"
+    SLIDE_UP_URL = "http://127.0.0.1:8766/slide-up"
 
     last_title = None
     last_url = None
@@ -294,6 +295,7 @@ def monitor_loop():
     last_contexts = []
     last_todo_ids = []
     own_window_active = False
+    is_window_down = False  # Track if reminder window is currently visible
 
     print("\n🔍 Window monitor active — watching active window...")
 
@@ -328,18 +330,20 @@ def monitor_loop():
             process_changed = process != last_process
             context_changed = set(active_contexts) != set(last_contexts)
 
-            # On context change: immediately clear reminder
+            # On context change: FIRST slide up immediately
             if context_changed or title_changed or process_changed:
-                try:
-                    req = urllib.request.Request(
-                        REMINDER_URL,
-                        data=json.dumps({"todos": [], "context": ""}).encode(),
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    urllib.request.urlopen(req, timeout=2)
-                except Exception:
-                    pass
+                if is_window_down:
+                    try:
+                        req = urllib.request.Request(
+                            SLIDE_UP_URL,
+                            data=b"{}",
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        urllib.request.urlopen(req, timeout=2)
+                        is_window_down = False
+                    except Exception:
+                        pass
 
             # Find matching todos
             matched_todos = get_todos_for_contexts(active_contexts) if active_contexts else []
@@ -373,33 +377,27 @@ def monitor_loop():
                 last_process = process
                 last_contexts = active_contexts
 
-            # Send reminder immediately (no delay)
+            # If there are matching todos, slide down with the todos
             if matched_todos and (todos_changed or context_changed or title_changed or process_changed):
-                try:
-                    ctx_str = ", ".join(active_contexts) if active_contexts else ""
-                    payload = json.dumps({"todos": matched_todos, "context": ctx_str}).encode()
-                    req = urllib.request.Request(
-                        REMINDER_URL,
-                        data=payload,
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    urllib.request.urlopen(req, timeout=2)
-                except Exception as e:
-                    print(f"  [reminder] Failed to send: {e}", flush=True)
-
-            elif not matched_todos and (todos_changed or context_changed):
-                # No todos, clear reminder
-                try:
-                    req = urllib.request.Request(
-                        REMINDER_URL,
-                        data=json.dumps({"todos": [], "context": ""}).encode(),
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    urllib.request.urlopen(req, timeout=2)
-                except Exception:
-                    pass
+                # Only show undone todos
+                undone_todos = [t for t in matched_todos if t.get("status") != "done"]
+                if undone_todos:
+                    # Wait for slide-up animation to finish before sliding down
+                    time.sleep(0.35)
+                    try:
+                        ctx_str = ", ".join(active_contexts) if active_contexts else ""
+                        payload = json.dumps({"todos": undone_todos, "context": ctx_str}).encode()
+                        req = urllib.request.Request(
+                            REMINDER_URL,
+                            data=payload,
+                            headers={"Content-Type": "application/json"},
+                            method="POST",
+                        )
+                        urllib.request.urlopen(req, timeout=2)
+                        is_window_down = True
+                    except Exception as e:
+                        print(f"  [reminder] Failed to send: {e}", flush=True)
+                # If all todos are done, don't show reminder (window stays up)
 
             last_todo_ids = current_todo_ids
 

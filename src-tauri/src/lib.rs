@@ -657,23 +657,54 @@ async fn note_hidden(app: tauri::AppHandle, is_destroying: bool) {
 
 // ─── Reminder Window ───
 
+/// Off-screen Y position (just above the visible area)
+const REMINDER_OFF_SCREEN_Y: f64 = -250.0;
+/// On-screen Y position (visible at top of screen)
+const REMINDER_ON_SCREEN_Y: f64 = 10.0;
+
+/// Animate window Y position from `from_y` to `to_y` in steps.
+fn animate_window_y(app: &tauri::AppHandle, from_y: f64, to_y: f64) {
+    let win = match app.get_webview_window("reminder") {
+        Some(w) => w,
+        None => return,
+    };
+
+    let steps = 20;
+    let total_distance = to_y - from_y;
+    let step_delay = std::time::Duration::from_millis(15);
+
+    for i in 1..=steps {
+        let progress = i as f64 / steps as f64;
+        // Ease-out cubic for smooth deceleration
+        let eased = 1.0 - (1.0 - progress).powi(3);
+        let current_y = from_y + total_distance * eased;
+
+        // Get current X position (keep it unchanged)
+        let x = match win.outer_position() {
+            Ok(pos) => pos.x,
+            Err(_) => 830,
+        };
+
+        win.set_position(tauri::PhysicalPosition::new(x, current_y as i32)).ok();
+        std::thread::sleep(step_delay);
+    }
+}
+
 /// Spawn the reminder window (once, at startup).
+/// Starts off-screen so it's not visible until todos arrive.
 fn spawn_reminder_window(app: &tauri::AppHandle) {
     if app.get_webview_window("reminder").is_some() {
         return;
     }
 
-    // Position at top-center of primary monitor
-    let (x, y) = match app.primary_monitor() {
+    // Position centered horizontally, but off-screen vertically
+    let x = match app.primary_monitor() {
         Ok(Some(monitor)) => {
             let size = monitor.size();
             let scale = monitor.scale_factor();
-            (
-                (size.width as f64 / scale - 260.0) / 2.0,
-                10.0,
-            )
+            (size.width as f64 / scale - 260.0) / 2.0
         }
-        _ => (830.0, 10.0), // fallback
+        _ => 830.0, // fallback
     };
 
     tauri::WebviewWindowBuilder::new(
@@ -683,7 +714,7 @@ fn spawn_reminder_window(app: &tauri::AppHandle) {
     )
     .title("Reminders")
     .inner_size(260.0, 200.0)
-    .position(x, y)
+    .position(x, REMINDER_OFF_SCREEN_Y)
     .resizable(false)
     .decorations(false)
     .transparent(true)
@@ -693,20 +724,41 @@ fn spawn_reminder_window(app: &tauri::AppHandle) {
     .ok();
 }
 
-/// Show matching todos in the reminder window.
+/// Show matching todos in the reminder window — slides down from off-screen.
 fn show_reminder(app: &tauri::AppHandle, todos: Vec<serde_json::Value>, context: String) {
     if let Some(win) = app.get_webview_window("reminder") {
-        let payload = serde_json::json!({ "todos": todos, "context": context });
+        // Filter out done todos on Rust side as well
+        let undone: Vec<&serde_json::Value> = todos.iter()
+            .filter(|t| t.get("status").and_then(|s| s.as_str()) != Some("done"))
+            .collect();
+
+        if undone.is_empty() {
+            // All todos are done — clear reminder instead
+            clear_reminder(app);
+            return;
+        }
+
+        let payload = serde_json::json!({ "todos": undone, "context": context });
         win.emit("reminder-data", payload).ok();
-        win.show().ok();
+        // Animate in background thread so we don't block HTTP requests
+        let app = app.clone();
+        std::thread::spawn(move || {
+            animate_window_y(&app, REMINDER_OFF_SCREEN_Y, REMINDER_ON_SCREEN_Y);
+        });
     }
 }
 
-/// Clear the reminder window (show placeholder).
+/// Clear the reminder window — slides back up off-screen.
 fn clear_reminder(app: &tauri::AppHandle) {
     if let Some(win) = app.get_webview_window("reminder") {
+        // First send empty data
         let payload = serde_json::json!({ "todos": [], "context": "" });
         win.emit("reminder-data", payload).ok();
+        // Animate in background thread so we don't block HTTP requests
+        let app = app.clone();
+        std::thread::spawn(move || {
+            animate_window_y(&app, REMINDER_ON_SCREEN_Y, REMINDER_OFF_SCREEN_Y);
+        });
     }
 }
 
@@ -741,6 +793,23 @@ fn start_reminder_http_server(app: tauri::AppHandle) {
 fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::Request) {
     use tiny_http::{Method, Response};
     use std::io::Cursor;
+
+    // Handle /slide-up: slide window up off-screen
+    if request.method() == &Method::Post && request.url() == "/slide-up" {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            clear_reminder(&app);
+        });
+        let resp_body = Cursor::new(b"{\"status\":\"sliding-up\"}");
+        let _ = request.respond(Response::new(
+            tiny_http::StatusCode(200),
+            Vec::new(),
+            resp_body,
+            None,
+            None,
+        ));
+        return;
+    }
 
     // Only accept POST to /remind
     if request.method() != &Method::Post || request.url() != "/remind" {
