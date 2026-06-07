@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import "../styles/reminder.css";
@@ -14,6 +14,8 @@ export default function ReminderWindow() {
   const [currentContext, setCurrentContext] = useState<string[]>([]);
   // Track todos that are fading out (strikethrough + opacity transition)
   const [fadingIds, setFadingIds] = useState<Set<string>>(new Set());
+  // Debounce guard: ignore hover events during slide animation (~300ms + safety margin)
+  const animLockRef = useRef(false);
 
   // Listen for reminder data from Rust
   useEffect(() => {
@@ -61,8 +63,22 @@ export default function ReminderWindow() {
     }
   };
 
+  const handleMouseEnter = () => {
+    if (animLockRef.current) return;
+    animLockRef.current = true;
+    fetch("http://127.0.0.1:8766/slide-down", { method: "POST" }).catch(() => {});
+    setTimeout(() => { animLockRef.current = false; }, 400);
+  };
+
+  const handleMouseLeave = () => {
+    if (animLockRef.current) return;
+    animLockRef.current = true;
+    fetch("http://127.0.0.1:8766/slide-up", { method: "POST" }).catch(() => {});
+    setTimeout(() => { animLockRef.current = false; }, 400);
+  };
+
   return (
-    <div className="reminder-window">
+    <div className="reminder-window" onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave}>
       {todos.length > 0 ? (
         todos.map((todo) => (
           <div

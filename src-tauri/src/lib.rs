@@ -3,7 +3,7 @@ mod models;
 use models::{Note, TodoItem};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::Manager;
@@ -661,7 +661,7 @@ async fn note_hidden(app: tauri::AppHandle, is_destroying: bool) {
 /// Off-screen Y position (just above the visible area)
 const REMINDER_OFF_SCREEN_Y: f64 = -250.0;
 /// On-screen Y position (visible at top of screen)
-const REMINDER_ON_SCREEN_Y: f64 = 10.0;
+const REMINDER_ON_SCREEN_Y: f64 = -1.0;
 
 /// Animate window Y position from `from_y` to `to_y` in steps.
 fn animate_window_y(app: &tauri::AppHandle, from_y: f64, to_y: f64) {
@@ -761,14 +761,28 @@ async fn check_context_todos_and_slide(app: tauri::AppHandle, contexts: Vec<Stri
     }
 }
 
+/// Slide the reminder window down to on-screen position (animation only).
+fn slide_down_reminder(app: &tauri::AppHandle) {
+    // Stop any ongoing bounce
+    stop_bounce(app);
+
+    // Set flag: window is now down
+    if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
+        state.store(true, Ordering::SeqCst);
+    }
+
+    // Animate in background thread so we don't block HTTP requests
+    let app = app.clone();
+    std::thread::spawn(move || {
+        animate_window_y(&app, REMINDER_OFF_SCREEN_Y, REMINDER_ON_SCREEN_Y);
+    });
+}
+
+#[allow(dead_code)]
 /// Show matching todos in the reminder window — slides down from off-screen.
+/// Kept for future use.
 fn show_reminder(app: &tauri::AppHandle, todos: Vec<serde_json::Value>, context: String) {
     if let Some(win) = app.get_webview_window("reminder") {
-        // Set flag: window is now down
-        if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
-            state.store(true, Ordering::SeqCst);
-        }
-
         // Filter out done todos on Rust side as well
         let undone: Vec<&serde_json::Value> = todos.iter()
             .filter(|t| t.get("status").and_then(|s| s.as_str()) != Some("done"))
@@ -782,17 +796,16 @@ fn show_reminder(app: &tauri::AppHandle, todos: Vec<serde_json::Value>, context:
 
         let payload = serde_json::json!({ "todos": undone, "context": context });
         win.emit("reminder-data", payload).ok();
-        // Animate in background thread so we don't block HTTP requests
-        let app = app.clone();
-        std::thread::spawn(move || {
-            animate_window_y(&app, REMINDER_OFF_SCREEN_Y, REMINDER_ON_SCREEN_Y);
-        });
+        slide_down_reminder(app);
     }
 }
 
 /// Clear the reminder window — slides back up off-screen.
 /// Only animates if the window is currently down.
 fn clear_reminder(app: &tauri::AppHandle) {
+    // Stop any ongoing bounce
+    stop_bounce(app);
+
     // Check if window is currently down
     if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
         // If already up (false), don't animate
@@ -805,12 +818,82 @@ fn clear_reminder(app: &tauri::AppHandle) {
         // First send empty data
         let payload = serde_json::json!({ "todos": [], "context": "" });
         win.emit("reminder-data", payload).ok();
+        // Get current Y so we slide up from wherever the window is
+        let current_y = win.outer_position().map(|p| p.y as f64).unwrap_or(REMINDER_ON_SCREEN_Y);
+        let from_y = current_y.max(REMINDER_OFF_SCREEN_Y); // clamp to off-screen minimum
         // Animate in background thread so we don't block HTTP requests
         let app = app.clone();
         std::thread::spawn(move || {
-            animate_window_y(&app, REMINDER_ON_SCREEN_Y, REMINDER_OFF_SCREEN_Y);
+            animate_window_y(&app, from_y, REMINDER_OFF_SCREEN_Y);
         });
     }
+}
+
+// ─── Reminder Window Bounce ───
+
+/// Stop the bounce animation (called before slide-down or slide-up).
+fn stop_bounce(app: &tauri::AppHandle) {
+    if let Some(state) = app.try_state::<Arc<AtomicU8>>() {
+        state.store(0, Ordering::SeqCst);
+    }
+}
+
+/// Start a continuous bounce loop: Y oscillates between -250 and -220 in a smooth cycle.
+fn start_bounce(app: &tauri::AppHandle) {
+    // Stop any existing bounce first
+    stop_bounce(app);
+
+    // Set the bounce flag to true
+    if let Some(state) = app.try_state::<Arc<AtomicU8>>() {
+        state.store(1, Ordering::SeqCst);
+    }
+
+    // Also set the reminder visibility flag to true so clear_reminder() can slide up
+    if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
+        state.store(true, Ordering::SeqCst);
+    }
+
+    let app = app.clone();
+    std::thread::spawn(move || {
+        let win = match app.get_webview_window("reminder") {
+            Some(w) => w,
+            None => return,
+        };
+
+        // Get current X so we can restore it
+        let current_pos = win.outer_position().unwrap_or(tauri::PhysicalPosition::new(0, 0));
+        let x = current_pos.x;
+
+        let base_y = REMINDER_OFF_SCREEN_Y; // -250
+        let amplitude = 30.0; // bounce 30px down
+
+        loop {
+            // Check if we should stop
+            if let Some(state) = app.try_state::<Arc<AtomicU8>>() {
+                if state.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+            }
+
+            // Smooth sine wave: y = base_y + amplitude * sin(t) where t goes 0..2π
+            // sin wave: starts at 0, goes up to 1 (down on screen), back to 0, to -1, back to 0
+            // We want: base_y → base_y+amplitude → base_y (only the downward half of sine)
+            // Actually, let's do a smooth triangular bounce: base_y → base_y+amplitude → base_y
+            // Using sin: (1 - cos(2πt)) / 2 gives 0→1→0 over one cycle
+            for step in 0..60 {
+                if let Some(state) = app.try_state::<Arc<AtomicU8>>() {
+                    if state.load(Ordering::SeqCst) == 0 {
+                        return;
+                    }
+                }
+                let t = (step as f64) / 60.0;
+                let offset = amplitude * (1.0 - (2.0 * std::f64::consts::PI * t).cos()) / 2.0;
+                let y = base_y + offset;
+                win.set_position(tauri::PhysicalPosition::new(x, y as i32)).ok();
+                std::thread::sleep(std::time::Duration::from_millis(16)); // ~60fps
+            }
+        }
+    });
 }
 
 // ─── HTTP Server for Python Monitor ───
@@ -862,6 +945,40 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
         return;
     }
 
+    // Handle /slide-down: slide window down to on-screen (animation only)
+    if request.method() == &Method::Post && request.url() == "/slide-down" {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            slide_down_reminder(&app);
+        });
+        let resp_body = Cursor::new(b"{\"status\":\"sliding-down\"}");
+        let _ = request.respond(Response::new(
+            tiny_http::StatusCode(200),
+            Vec::new(),
+            resp_body,
+            None,
+            None,
+        ));
+        return;
+    }
+
+    // Handle /bounce: continuous bounce animation (Y: -250 ↔ -220)
+    if request.method() == &Method::Post && request.url() == "/bounce" {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            start_bounce(&app);
+        });
+        let resp_body = Cursor::new(b"{\"status\":\"bouncing\"}");
+        let _ = request.respond(Response::new(
+            tiny_http::StatusCode(200),
+            Vec::new(),
+            resp_body,
+            None,
+            None,
+        ));
+        return;
+    }
+
     // Only accept POST to /remind
     if request.method() != &Method::Post || request.url() != "/remind" {
         let body = Cursor::new(b"{}");
@@ -895,7 +1012,23 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
         let todos: Vec<serde_json::Value> = todos.iter().cloned().collect();
         let context = payload["context"].as_str().unwrap_or("").to_string();
         if !todos.is_empty() {
-            show_reminder(app, todos, context);
+            // Send todo data to the frontend for display
+            if let Some(win) = app.get_webview_window("reminder") {
+                let undone: Vec<&serde_json::Value> = todos.iter()
+                    .filter(|t| t.get("status").and_then(|s| s.as_str()) != Some("done"))
+                    .collect();
+                if !undone.is_empty() {
+                    let payload = serde_json::json!({ "todos": undone, "context": context });
+                    win.emit("reminder-data", payload).ok();
+                    // Start bounce animation instead of sliding down
+                    let app = app.clone();
+                    std::thread::spawn(move || {
+                        start_bounce(&app);
+                    });
+                } else {
+                    clear_reminder(app);
+                }
+            }
         } else {
             clear_reminder(app);
         }
@@ -1015,6 +1148,9 @@ pub fn run() {
 
             // Track reminder window state (false = up/off-screen, true = down/visible)
             app.manage(Arc::new(AtomicBool::new(false)));
+
+            // Track bounce loop state (0 = not bouncing, 1 = bouncing)
+            app.manage(Arc::new(AtomicU8::new(0)));
 
             // --- Tray icon & menu ---
             let menu = Menu::with_items(
