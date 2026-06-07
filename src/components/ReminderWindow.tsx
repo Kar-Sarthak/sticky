@@ -57,7 +57,7 @@ export default function ReminderWindow() {
           next.delete(todoId);
           return next;
         });
-      }, 600);
+      }, 100);
     } catch (err) {
       console.error("Failed to toggle todo:", err);
     }

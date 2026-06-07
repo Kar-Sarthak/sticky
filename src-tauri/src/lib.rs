@@ -818,9 +818,8 @@ fn clear_reminder(app: &tauri::AppHandle, clear_todos: bool) {
             let current_y = win.outer_position().map(|p| p.y as f64).unwrap_or(REMINDER_ON_SCREEN_Y);
             let from_y = current_y.max(REMINDER_OFF_SCREEN_Y);
             animate_window_y(&app, from_y, REMINDER_OFF_SCREEN_Y);
-            // After sliding up, slide back down to show bottom 10px peek (only if flag is set)
+            // After sliding up, slide back down to show bottom 10px peek (only if flag was set)
             if peek_val {
-                std::thread::sleep(std::time::Duration::from_millis(350));
                 animate_window_y(&app, REMINDER_OFF_SCREEN_Y, REMINDER_PEEK_Y);
             }
         }
