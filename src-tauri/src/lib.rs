@@ -3,6 +3,7 @@ mod models;
 use models::{Note, TodoItem};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::Manager;
@@ -722,11 +723,52 @@ fn spawn_reminder_window(app: &tauri::AppHandle) {
     .skip_taskbar(true)
     .build()
     .ok();
+
+    // Force off-screen position again to override any OS clamping
+    if let Some(win) = app.get_webview_window("reminder") {
+        win.set_position(tauri::PhysicalPosition::new(x as i32, REMINDER_OFF_SCREEN_Y as i32)).ok();
+    }
+}
+
+/// Check if there are any undone todos for the given contexts. If not, slide the reminder up.
+#[tauri::command]
+async fn check_context_todos_and_slide(app: tauri::AppHandle, contexts: Vec<String>) -> Result<bool, String> {
+    // Load contexts.json
+    let ctx_map = get_contexts(&app)?;
+
+    // Find all todo IDs matching the given contexts
+    let mut matching_todo_ids = Vec::new();
+    for ctx in &contexts {
+        let ctx_lower = ctx.to_lowercase();
+        for (key, ids) in &ctx_map {
+            if key.to_lowercase() == ctx_lower || key.to_lowercase().contains(&ctx_lower) || ctx_lower.contains(&key.to_lowercase()) {
+                matching_todo_ids.extend(ids.clone());
+            }
+        }
+    }
+
+    // Load todos.json and check how many matching todos are undone
+    let todos = get_all_todos(&app)?;
+    let undone_count = todos.iter().filter(|t| {
+        matching_todo_ids.contains(&t.id) && t.status != "done"
+    }).count();
+
+    if undone_count == 0 {
+        clear_reminder(&app);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 /// Show matching todos in the reminder window — slides down from off-screen.
 fn show_reminder(app: &tauri::AppHandle, todos: Vec<serde_json::Value>, context: String) {
     if let Some(win) = app.get_webview_window("reminder") {
+        // Set flag: window is now down
+        if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
+            state.store(true, Ordering::SeqCst);
+        }
+
         // Filter out done todos on Rust side as well
         let undone: Vec<&serde_json::Value> = todos.iter()
             .filter(|t| t.get("status").and_then(|s| s.as_str()) != Some("done"))
@@ -749,7 +791,16 @@ fn show_reminder(app: &tauri::AppHandle, todos: Vec<serde_json::Value>, context:
 }
 
 /// Clear the reminder window — slides back up off-screen.
+/// Only animates if the window is currently down.
 fn clear_reminder(app: &tauri::AppHandle) {
+    // Check if window is currently down
+    if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
+        // If already up (false), don't animate
+        if state.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+            return;
+        }
+    }
+
     if let Some(win) = app.get_webview_window("reminder") {
         // First send empty data
         let payload = serde_json::json!({ "todos": [], "context": "" });
@@ -962,6 +1013,9 @@ pub fn run() {
                 notes_visible: Mutex::new(true),
             });
 
+            // Track reminder window state (false = up/off-screen, true = down/visible)
+            app.manage(Arc::new(AtomicBool::new(false)));
+
             // --- Tray icon & menu ---
             let menu = Menu::with_items(
                 app,
@@ -1020,7 +1074,8 @@ pub fn run() {
             toggle_todo,
             delete_todo,
             delete_note_todos,
-            get_note_todos
+            get_note_todos,
+            check_context_todos_and_slide
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

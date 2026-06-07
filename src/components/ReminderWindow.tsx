@@ -11,18 +11,22 @@ interface ReminderTodo {
 
 export default function ReminderWindow() {
   const [todos, setTodos] = useState<ReminderTodo[]>([]);
+  const [currentContext, setCurrentContext] = useState<string[]>([]);
   // Track todos that are fading out (strikethrough + opacity transition)
   const [fadingIds, setFadingIds] = useState<Set<string>>(new Set());
 
   // Listen for reminder data from Rust
   useEffect(() => {
-    const unlisten = getCurrentWindow().listen<{ todos: ReminderTodo[] }>(
+    const unlisten = getCurrentWindow().listen<{ todos: ReminderTodo[]; context: string }>(
       "reminder-data",
       (event) => {
         const data = event.payload;
         setFadingIds(new Set());
         const undone = data.todos.filter((t) => t.status !== "done");
         setTodos(undone);
+        if (data.context) {
+          setCurrentContext(data.context.split(", "));
+        }
       }
     );
 
@@ -38,7 +42,14 @@ export default function ReminderWindow() {
       setFadingIds((prev) => new Set([...prev, todoId]));
       // Remove from list after animation completes
       setTimeout(() => {
-        setTodos((prev) => prev.filter((t) => t.id !== todoId));
+        setTodos((prev) => {
+          const newTodos = prev.filter((t) => t.id !== todoId);
+          // If list is now empty, check backend for remaining undone todos in current context
+          if (newTodos.length === 0) {
+            invoke("check_context_todos_and_slide", { contexts: currentContext }).catch(() => {});
+          }
+          return newTodos;
+        });
         setFadingIds((prev) => {
           const next = new Set(prev);
           next.delete(todoId);

@@ -324,14 +324,12 @@ def monitor_loop():
             # Detect context (URL + process mapping)
             active_contexts, url = detect_current_contexts(title, process, hwnd)
 
-            # Check if anything changed
-            title_changed = title != last_title
-            url_changed = url != last_url
-            process_changed = process != last_process
+            # Check if the CONTEXT SET changed (not just URL/title within same context)
             context_changed = set(active_contexts) != set(last_contexts)
 
-            # On context change: FIRST slide up immediately
-            if context_changed or title_changed or process_changed:
+            # On CONTEXT CHANGE: FIRST slide up immediately
+            # Don't slide up on URL/title changes within the same context
+            if context_changed:
                 if is_window_down:
                     try:
                         req = urllib.request.Request(
@@ -344,6 +342,9 @@ def monitor_loop():
                         is_window_down = False
                     except Exception:
                         pass
+                # Update tracking state
+                last_contexts = active_contexts
+                last_todo_ids = []
 
             # Find matching todos
             matched_todos = get_todos_for_contexts(active_contexts) if active_contexts else []
@@ -351,6 +352,9 @@ def monitor_loop():
             todos_changed = current_todo_ids != last_todo_ids
 
             # Print window info if something changed
+            title_changed = title != last_title
+            url_changed = url != last_url
+            process_changed = process != last_process
             if title_changed or url_changed or process_changed:
                 display_url = f" | URL: {url[:80]}" if url else ""
                 print(f"\n{'─' * 55}", flush=True)
@@ -375,10 +379,9 @@ def monitor_loop():
                 last_title = title
                 last_url = url
                 last_process = process
-                last_contexts = active_contexts
 
-            # If there are matching todos, slide down with the todos
-            if matched_todos and (todos_changed or context_changed or title_changed or process_changed):
+            # If context changed and there are matching todos, slide down
+            if context_changed and matched_todos:
                 # Only show undone todos
                 undone_todos = [t for t in matched_todos if t.get("status") != "done"]
                 if undone_todos:
@@ -397,7 +400,6 @@ def monitor_loop():
                         is_window_down = True
                     except Exception as e:
                         print(f"  [reminder] Failed to send: {e}", flush=True)
-                # If all todos are done, don't show reminder (window stays up)
 
             last_todo_ids = current_todo_ids
 
