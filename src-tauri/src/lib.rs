@@ -27,6 +27,11 @@ struct NotesVisibility {
     notes_visible: Mutex<bool>,
 }
 
+/// Tracks whether the reminder window has todos loaded (for peek-on-slide-up behavior).
+struct ReminderHasTodos {
+    has_todos: AtomicBool,
+}
+
 /// Toggle visibility of all note windows.
 /// If notes_visible == true → hide all notes, set notes_visible = false.
 /// If notes_visible == false → show all notes, set notes_visible = true.
@@ -754,7 +759,7 @@ async fn check_context_todos_and_slide(app: tauri::AppHandle, contexts: Vec<Stri
     }).count();
 
     if undone_count == 0 {
-        clear_reminder(&app);
+        clear_reminder(&app, true);
         Ok(true)
     } else {
         Ok(false)
@@ -790,7 +795,7 @@ fn show_reminder(app: &tauri::AppHandle, todos: Vec<serde_json::Value>, context:
 
         if undone.is_empty() {
             // All todos are done — clear reminder instead
-            clear_reminder(app);
+            clear_reminder(app, true);
             return;
         }
 
@@ -801,32 +806,59 @@ fn show_reminder(app: &tauri::AppHandle, todos: Vec<serde_json::Value>, context:
 }
 
 /// Clear the reminder window — slides back up off-screen.
-/// Only animates if the window is currently down.
-fn clear_reminder(app: &tauri::AppHandle) {
+/// `clear_todos` — true when there are genuinely no todos left (clears the peek flag).
+///                  false for temporary slide-ups like mouse-leave (preserves the peek flag).
+fn clear_reminder(app: &tauri::AppHandle, clear_todos: bool) {
     // Stop any ongoing bounce
     stop_bounce(app);
 
-    // Check if window is currently down
-    if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
-        // If already up (false), don't animate
-        if state.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-            return;
+    // For temporary hover-hide: only animate if window is currently down
+    // For genuine todo clears: always run regardless of current state
+    if !clear_todos {
+        if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
+            if state.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                return;
+            }
+        }
+    } else {
+        // Force the flag to false (window is now up)
+        if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
+            state.store(false, Ordering::SeqCst);
         }
     }
 
-    if let Some(win) = app.get_webview_window("reminder") {
-        // First send empty data
-        let payload = serde_json::json!({ "todos": [], "context": "" });
-        win.emit("reminder-data", payload).ok();
-        // Get current Y so we slide up from wherever the window is
-        let current_y = win.outer_position().map(|p| p.y as f64).unwrap_or(REMINDER_ON_SCREEN_Y);
-        let from_y = current_y.max(REMINDER_OFF_SCREEN_Y); // clamp to off-screen minimum
-        // Animate in background thread so we don't block HTTP requests
-        let app = app.clone();
-        std::thread::spawn(move || {
+    // Read peek flag (only clear it if todos are genuinely gone)
+    let peek_val = if clear_todos {
+        // Clear the flag so no peek happens after this
+        app.try_state::<Arc<ReminderHasTodos>>()
+            .map(|s| { s.has_todos.store(false, Ordering::SeqCst); s.has_todos.load(Ordering::SeqCst) })
+            .unwrap_or(false)
+    } else {
+        app.try_state::<Arc<ReminderHasTodos>>()
+            .map(|s| s.has_todos.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    };
+
+    // Get current Y so we slide up from wherever the window is
+    let app = app.clone();
+    std::thread::spawn(move || {
+        if let Some(win) = app.get_webview_window("reminder") {
+            // Clear frontend todo data only when todos are genuinely gone
+            if clear_todos {
+                let payload = serde_json::json!({ "todos": [], "context": "" });
+                win.emit("reminder-data", payload).ok();
+            }
+            // Get current Y so we slide up from wherever the window is
+            let current_y = win.outer_position().map(|p| p.y as f64).unwrap_or(REMINDER_ON_SCREEN_Y);
+            let from_y = current_y.max(REMINDER_OFF_SCREEN_Y);
             animate_window_y(&app, from_y, REMINDER_OFF_SCREEN_Y);
-        });
-    }
+            // After sliding up, slide back down to show bottom 10px peek (only if flag is set)
+            if peek_val {
+                std::thread::sleep(std::time::Duration::from_millis(350));
+                animate_window_y(&app, REMINDER_OFF_SCREEN_Y, -190.0);
+            }
+        }
+    });
 }
 
 // ─── Reminder Window Bounce ───
@@ -928,13 +960,30 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
     use tiny_http::{Method, Response};
     use std::io::Cursor;
 
-    // Handle /slide-up: slide window up off-screen
+    // Handle /slide-up: slide window up off-screen (Python monitor — clears frontend data)
     if request.method() == &Method::Post && request.url() == "/slide-up" {
         let app = app.clone();
         std::thread::spawn(move || {
-            clear_reminder(&app);
+            clear_reminder(&app, true);
         });
         let resp_body = Cursor::new(b"{\"status\":\"sliding-up\"}");
+        let _ = request.respond(Response::new(
+            tiny_http::StatusCode(200),
+            Vec::new(),
+            resp_body,
+            None,
+            None,
+        ));
+        return;
+    }
+
+    // Handle /hover-hide: slide window up but preserve frontend data (for mouse-leave)
+    if request.method() == &Method::Post && request.url() == "/hover-hide" {
+        let app = app.clone();
+        std::thread::spawn(move || {
+            clear_reminder(&app, false);
+        });
+        let resp_body = Cursor::new(b"{\"status\":\"hover-hiding\"}");
         let _ = request.respond(Response::new(
             tiny_http::StatusCode(200),
             Vec::new(),
@@ -1020,20 +1069,33 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
                 if !undone.is_empty() {
                     let payload = serde_json::json!({ "todos": undone, "context": context });
                     win.emit("reminder-data", payload).ok();
+                    // Set peek flag so clear_reminder knows to leave a peek
+                    if let Some(state) = app.try_state::<Arc<ReminderHasTodos>>() {
+                        state.has_todos.store(true, Ordering::SeqCst);
+                    }
                     // Start bounce animation instead of sliding down
                     let app = app.clone();
                     std::thread::spawn(move || {
                         start_bounce(&app);
                     });
                 } else {
-                    clear_reminder(app);
+                    if let Some(state) = app.try_state::<Arc<ReminderHasTodos>>() {
+                        state.has_todos.store(false, Ordering::SeqCst);
+                    }
+                    clear_reminder(app, true);
                 }
             }
         } else {
-            clear_reminder(app);
+            if let Some(state) = app.try_state::<Arc<ReminderHasTodos>>() {
+                state.has_todos.store(false, Ordering::SeqCst);
+            }
+            clear_reminder(app, true);
         }
     } else {
-        clear_reminder(app);
+        if let Some(state) = app.try_state::<Arc<ReminderHasTodos>>() {
+            state.has_todos.store(false, Ordering::SeqCst);
+        }
+        clear_reminder(app, true);
     }
 
     let resp_body = Cursor::new(b"{\"status\":\"ok\"}");
@@ -1151,6 +1213,9 @@ pub fn run() {
 
             // Track bounce loop state (0 = not bouncing, 1 = bouncing)
             app.manage(Arc::new(AtomicU8::new(0)));
+
+            // Track whether reminder has todos loaded (controls peek-on-slide-up)
+            app.manage(Arc::new(ReminderHasTodos { has_todos: AtomicBool::new(false) }));
 
             // --- Tray icon & menu ---
             let menu = Menu::with_items(

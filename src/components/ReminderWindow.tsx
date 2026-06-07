@@ -73,7 +73,7 @@ export default function ReminderWindow() {
   const handleMouseLeave = () => {
     if (animLockRef.current) return;
     animLockRef.current = true;
-    fetch("http://127.0.0.1:8766/slide-up", { method: "POST" }).catch(() => {});
+    fetch("http://127.0.0.1:8766/hover-hide", { method: "POST" }).catch(() => {});
     setTimeout(() => { animLockRef.current = false; }, 400);
   };
 
