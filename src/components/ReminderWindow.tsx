@@ -14,8 +14,9 @@ export default function ReminderWindow() {
   const [currentContext, setCurrentContext] = useState<string[]>([]);
   // Track todos that are fading out (strikethrough + opacity transition)
   const [fadingIds, setFadingIds] = useState<Set<string>>(new Set());
-  // Debounce guard: ignore hover events during slide animation (~300ms + safety margin)
+  // Debounce guard: single lock for animations.
   const animLockRef = useRef(false);
+  const windowRef = useRef<HTMLDivElement>(null);
 
   // Listen for reminder data from Rust
   useEffect(() => {
@@ -67,7 +68,17 @@ export default function ReminderWindow() {
     if (animLockRef.current) return;
     animLockRef.current = true;
     fetch("http://127.0.0.1:8766/slide-down", { method: "POST" }).catch(() => {});
-    setTimeout(() => { animLockRef.current = false; }, 400);
+    // After animation completes (400ms), check if mouse is still over window.
+    // If not, fire hover-hide (the window slid past the cursor during animation).
+    setTimeout(() => {
+      animLockRef.current = false;
+      const el = windowRef.current;
+      if (el && !el.matches(':hover')) {
+        fetch("http://127.0.0.1:8766/hover-hide", { method: "POST" }).catch(() => {});
+        animLockRef.current = true;
+        setTimeout(() => { animLockRef.current = false; }, 400);
+      }
+    }, 400);
   };
 
   const handleMouseLeave = () => {
@@ -78,7 +89,7 @@ export default function ReminderWindow() {
   };
 
   return (
-    <div className="reminder-window" onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave}>
+    <div className="reminder-window" ref={windowRef} onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave}>
       {todos.length > 0 ? (
         todos.map((todo) => (
           <div
