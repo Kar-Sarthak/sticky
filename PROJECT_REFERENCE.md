@@ -221,6 +221,7 @@ Populated asynchronously by the Python context classifier server. When a new tod
 - **Reminder window state** — `Arc<AtomicBool>`: `false` = window is up/off-screen, `true` = window is down/visible. Prevents redundant slide-up animations.
 - **Reminder has-todos flag** — `Arc<ReminderHasTodos>`: tracks if todos are loaded for the current context, controls the peek behavior after hover-hide.
 - **Bounce loop state** — `Arc<AtomicU8>`: `0` = not bouncing, `1` = bouncing. Controls the continuous bounce animation thread.
+- **Bounce generation** — `Arc<ReminderBounceGen>`: `AtomicU32` counter incremented on `/slide-up`. Used to cancel stale delayed bounces when the context changes again within the 3-second delay window.
 
 **Functions:**
 - `toggle_note_windows(app)` — Reads `NotesVisibility`. If true: hides all note windows and sets to false. If false: shows all and sets to true
@@ -356,7 +357,7 @@ A single persistent reminder window that shows matching todos for the current ac
 A lightweight `tiny_http` server running inside the Tauri app that receives reminder requests from the Python monitor.
 
 **Endpoints:**
-- `POST /remind` — Body: `{"todos": [...], "context": "..."}` → Sends todo data to reminder window via event, starts bounce animation (Y: -180 ↔ -150)
+- `POST /remind` — Body: `{"todos": [...], "context": "..."}` → Sends todo data to reminder window via event, then waits **3 seconds** before starting bounce animation. During the wait, checks `ReminderBounceGen` — if the generation changed (meaning `/slide-up` was called), cancels the stale bounce. This handles rapid context switches where the user moves to a different app within the delay window.
 - `POST /slide-up` — Slides window up to -300, clears frontend todo data (called by Python monitor on context change)
 - `POST /slide-down` — Slides window down to y=-1 from the **current window Y position** (reads actual position, no jump, called by frontend on hover)
 - `POST /hover-hide` — Slides window up, then peeks at y = -190 (bottom 10px visible). Preserves frontend todo data (called by frontend on mouse-leave)
@@ -371,6 +372,7 @@ A lightweight `tiny_http` server running inside the Tauri app that receives remi
 - `Arc<AtomicBool>` — visibility flag (`true` = window is down/visible, `false` = up/off-screen)
 - `Arc<AtomicU8>` — bounce loop flag (`1` = bouncing, `0` = not)
 - `Arc<ReminderHasTodos>` — peek flag (`true` = has todos loaded, controls peek-after-hover-hide behavior)
+- `Arc<ReminderBounceGen>` — generation counter (`AtomicU32`), incremented on `/slide-up` to cancel stale delayed bounces
 - `clear_reminder(app, clear_todos)` — if `clear_todos=true`: always runs, clears data + peek flag; if `clear_todos=false`: only runs if window is down, preserves data + peek flag
 
 ---
@@ -720,10 +722,11 @@ The `animate_window_y()` function runs in a **separate background thread** for e
 When `toggle_todo` is called, Rust emits a `todo-updated` event. All note windows and the reminder window listen for this event and refresh their todo lists. This ensures checkboxes stay in sync across all windows.
 
 ### 14. Reminder State Tracking
-Three separate state types track reminder behavior:
+Four separate state types track reminder behavior:
 - `Arc<AtomicBool>` — visibility flag (`true` = down, `false` = up). Used by `clear_reminder()` to skip redundant animations when `clear_todos=false`.
 - `Arc<AtomicU8>` — bounce loop flag (`1` = bouncing, `0` = not). Setting to 0 causes the loop thread to break on next frame.
 - `Arc<ReminderHasTodos>` — peek flag. Controls whether the window peeks at y=-190 after a hover-hide.
+- `Arc<ReminderBounceGen>` — bounce generation (`AtomicU32`). Incremented on `/slide-up`. The `/remind` handler captures the current generation before sleeping 3 seconds; after the sleep, it checks if the generation still matches. If it doesn't, a context change happened during the delay and the bounce is cancelled.
 
 ### 15. Context-Set Change Detection
 The monitor only triggers the reminder workflow when the **set of context labels** changes (e.g., `{"linkedin"}` → `{"github"}`). Navigating between different pages of the same website (e.g., LinkedIn jobs → LinkedIn notifications) does NOT trigger the workflow, preventing unnecessary animations.
@@ -742,6 +745,9 @@ After a hover-hide with todos loaded, the window slides up to -300 then automati
 
 ### 19. Startup Position Override
 Tauri/Windows may clamp negative Y positions to `0` during window creation. After building the reminder window, an explicit `set_position()` call forces it to the off-screen coordinate (-300) to ensure it starts properly hidden.
+
+### 20. Delayed Bounce + Stale Cancellation
+When the Python monitor detects a context change and sends a `/remind` request, Rust does **not** start bouncing immediately. Instead, it captures the current `ReminderBounceGen` value, sleeps 3 seconds, then checks if the generation still matches. If the user switches contexts again within those 3 seconds, Python calls `/slide-up`, which increments the generation counter. The stale bounce thread wakes up, sees the mismatch, and cancels itself. This prevents the reminder from showing todos for the wrong app after a rapid context switch.
 
 ---
 

@@ -3,7 +3,7 @@ mod models;
 use models::{Note, TodoItem};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::Manager;
@@ -30,6 +30,12 @@ struct NotesVisibility {
 /// Tracks whether the reminder window has todos loaded (for peek-on-slide-up behavior).
 struct ReminderHasTodos {
     has_todos: AtomicBool,
+}
+
+/// Generation counter to cancel stale bounces when the context changes.
+/// Incremented on /slide-up; bounce sleeps then checks if generation still matches.
+struct ReminderBounceGen {
+    gen: AtomicU32,
 }
 
 /// Toggle visibility of all note windows.
@@ -778,6 +784,11 @@ fn clear_reminder(app: &tauri::AppHandle, clear_todos: bool) {
     // Stop any ongoing bounce
     stop_bounce(app);
 
+    // Bump generation to cancel any pending delayed bounce
+    if let Some(state) = app.try_state::<Arc<ReminderBounceGen>>() {
+        state.gen.fetch_add(1, Ordering::SeqCst);
+    }
+
     // For temporary hover-hide: only animate if window is currently down
     // For genuine todo clears: always run regardless of current state
     if !clear_todos {
@@ -1031,10 +1042,21 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
                     if let Some(state) = app.try_state::<Arc<ReminderHasTodos>>() {
                         state.has_todos.store(true, Ordering::SeqCst);
                     }
-                    // Start bounce animation instead of sliding down
+                    // Wait 3 seconds before bouncing — allows Python monitor to
+                    // detect another context switch and cancel via /slide-up
+                    let captured_gen = app.try_state::<Arc<ReminderBounceGen>>()
+                        .map(|s| s.gen.load(Ordering::SeqCst))
+                        .unwrap_or(0);
                     let app = app.clone();
                     std::thread::spawn(move || {
-                        start_bounce(&app);
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        // If generation changed, a /slide-up happened — skip stale bounce
+                        let still_valid = app.try_state::<Arc<ReminderBounceGen>>()
+                            .map(|s| s.gen.load(Ordering::SeqCst) == captured_gen)
+                            .unwrap_or(false);
+                        if still_valid {
+                            start_bounce(&app);
+                        }
                     });
                 } else {
                     if let Some(state) = app.try_state::<Arc<ReminderHasTodos>>() {
@@ -1174,6 +1196,9 @@ pub fn run() {
 
             // Track whether reminder has todos loaded (controls peek-on-slide-up)
             app.manage(Arc::new(ReminderHasTodos { has_todos: AtomicBool::new(false) }));
+
+            // Track bounce generation (incremented on /slide-up to cancel stale bounces)
+            app.manage(Arc::new(ReminderBounceGen { gen: AtomicU32::new(0) }));
 
             // --- Tray icon & menu ---
             let menu = Menu::with_items(
