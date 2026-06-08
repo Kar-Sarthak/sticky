@@ -228,19 +228,6 @@ fn spawn_context_server() {
         return;
     }
 
-    // Check if google-genai is installed
-    let pip_check = Command::new("python")
-        .arg("-c")
-        .arg("import google.genai")
-        .output();
-
-    if let Ok(output) = pip_check {
-        if !output.status.success() {
-            eprintln!("[context] google-genai not installed. Run: pip install google-genai");
-            return;
-        }
-    }
-
     // Start the server in the background
     let server_proc = Command::new("python")
         .arg(&script)

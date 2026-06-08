@@ -2,7 +2,7 @@
 Sticky Notes Context Classifier & Window Monitor Server
 --------------------------------------------------------
 1. HTTP server that classifies todo text into app/website contexts
-   using Google's Gemini API.
+   using Groq AI API.
 2. Background window monitor that detects the active window title
    and browser URL (for Firefox/Chrome/Edge).
 
@@ -25,22 +25,18 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 # ─── CONFIG ────────────────────────────────────────────────────────────
 HOST = "127.0.0.1"
 PORT = 8765
-API_KEY = os.environ.get("GEMINI_API_KEY", "")
-MODEL = "gemini-3.1-flash-lite"
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
+MODEL = "llama-3.3-70b-versatile"
 POLL_INTERVAL = 1  # seconds between window checks
 
-# ─── GEMINI CLIENT ─────────────────────────────────────────────────────
-try:
-    from google import genai
-except ImportError:
-    print("ERROR: google-genai not installed. Run: pip install google-genai", file=sys.stderr)
+# ─── GROQ CLIENT ───────────────────────────────────────────────────────
+import urllib.request
+
+if not GROQ_API_KEY:
+    print("ERROR: GROQ_API_KEY not set. Add it to src-tauri/.env", file=sys.stderr)
     sys.exit(1)
 
-if not API_KEY:
-    print("ERROR: GEMINI_API_KEY not set. Add it to src-tauri/.env", file=sys.stderr)
-    sys.exit(1)
-
-client = genai.Client(api_key=API_KEY)
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # ─── WINDOW DETECTION ──────────────────────────────────────────────────
 try:
@@ -419,8 +415,8 @@ Return ONLY valid JSON in this format:
 Rules:
 - Focus on the most likely execution environment
 - Be specific (e.g., "linkedin", "gmail", "github", "leetcode", "notion", "vscode", "youtube", "chatgpt", "google docs", "figma", "slack", "discord", "calendar")
-- Include up to 3 contexts max if multiple are strongly relevant
-- If uncertain, return ["general"]
+- Include up to 1 contexts max 
+
 - Do NOT add markdown, text, or reasoning
 - Output must be valid JSON
 
@@ -430,17 +426,39 @@ Task: {text}
 
 def classify_todo(text: str) -> list[str]:
     prompt = CLASSIFY_PROMPT.format(text=text)
-    response = client.models.generate_content(model=MODEL, contents=prompt)
+    payload = json.dumps({
+        "model": MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+    }).encode("utf-8")
+
     try:
-        data = json.loads(response.text)
-        return data.get("contexts", ["general"])
-    except Exception:
-        cleaned = response.text.strip().replace("```json", "").replace("```", "").strip()
+        req = urllib.request.Request(
+            GROQ_URL,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            },
+            method="POST",
+        )
+        resp = urllib.request.urlopen(req, timeout=10)
+        body = json.loads(resp.read().decode("utf-8"))
+        content = body["choices"][0]["message"]["content"]
+        print(f"  [classify] Raw response: {content!r}", flush=True)
+
+        # Try to parse the JSON response
         try:
-            data = json.loads(cleaned)
+            data = json.loads(content)
             return data.get("contexts", ["general"])
         except Exception:
-            return ["general"]
+            cleaned = content.strip().replace("```json", "").replace("```", "").strip()
+            data = json.loads(cleaned)
+            return data.get("contexts", ["general"])
+    except Exception as e:
+        print(f"  [classify error] {e}", flush=True)
+        return ["general"]
 
 
 # ─── HTTP SERVER ───────────────────────────────────────────────────────
