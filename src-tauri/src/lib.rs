@@ -862,19 +862,8 @@ fn start_bounce(app: &tauri::AppHandle) {
         let base_y = REMINDER_BOUNCE_BASE_Y;
         let amplitude = 30.0; // bounce 30px down
 
-        loop {
-            // Check if we should stop
-            if let Some(state) = app.try_state::<Arc<AtomicU8>>() {
-                if state.load(Ordering::SeqCst) == 0 {
-                    break;
-                }
-            }
-
-            // Smooth sine wave: y = base_y + amplitude * sin(t) where t goes 0..2π
-            // sin wave: starts at 0, goes up to 1 (down on screen), back to 0, to -1, back to 0
-            // We want: base_y → base_y+amplitude → base_y (only the downward half of sine)
-            // Actually, let's do a smooth triangular bounce: base_y → base_y+amplitude → base_y
-            // Using sin: (1 - cos(2πt)) / 2 gives 0→1→0 over one cycle
+        // Bounce for exactly 5 cycles, then slide to peek
+        for _cycle in 0..5 {
             for step in 0..60 {
                 if let Some(state) = app.try_state::<Arc<AtomicU8>>() {
                     if state.load(Ordering::SeqCst) == 0 {
@@ -885,9 +874,12 @@ fn start_bounce(app: &tauri::AppHandle) {
                 let offset = amplitude * (1.0 - (2.0 * std::f64::consts::PI * t).cos()) / 2.0;
                 let y = base_y + offset;
                 win.set_position(tauri::PhysicalPosition::new(x, y as i32)).ok();
-                std::thread::sleep(std::time::Duration::from_millis(16)); // ~60fps
+                std::thread::sleep(std::time::Duration::from_millis(16));
             }
         }
+
+        // After 5 bounces, slide to peek
+        clear_reminder(&app, false);
     });
 }
 
