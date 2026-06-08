@@ -7,12 +7,12 @@
   flex-direction: column;
   position: relative;
   overflow: hidden;
+  border-radius: 4px;
 }
 
 .note-inner {
   flex: 1;
-  overflow: hidden;
-  border-radius: 4px;
+  overflow: visible;
   display: flex;
   flex-direction: column;
   position: relative;
@@ -30,30 +30,93 @@
     0 10px 24px rgba(0, 0, 0, 0.10);
 }
 
-/* Paper texture overlay */
-.note-inner::before {
+/* Wrinkled paper texture — two-layer blend */
+.note-inner::before,
+.note-inner::after {
   content: "";
   position: absolute;
   inset: 0;
   z-index: 1;
   pointer-events: none;
-  opacity: 0.04;
-  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
-  background-repeat: repeat;
-  background-size: 128px 128px;
+  background:
+    linear-gradient(12deg, #000 85%, #fff 97%),
+    linear-gradient(67deg, #000 23%, #fff 31%),
+    linear-gradient(154deg, #000 41%, #fff 58%),
+    linear-gradient(99deg, #000 62%, #fff 73%),
+    linear-gradient(35deg, #000 15%, #fff 28%),
+    linear-gradient(178deg, #000 50%, #fff 69%),
+    linear-gradient(44deg, #000 71%, #fff 83%),
+    linear-gradient(111deg, #000 33%, #fff 45%),
+    linear-gradient(8deg, #000 56%, #fff 71%),
+    linear-gradient(143deg, #000 12%, #fff 22%),
+    linear-gradient(76deg, #000 78%, #fff 95%),
+    linear-gradient(29deg, #000 45%, #fff 56%),
+    linear-gradient(167deg, #000 60%, #fff 80%),
+    linear-gradient(91deg, #000 27%, #fff 42%),
+    linear-gradient(53deg, #000 83%, #fff 96%),
+    linear-gradient(136deg, #000 39%, #fff 54%),
+    linear-gradient(20deg, #000 70%, #fff 87%),
+    linear-gradient(158deg, #000 52%, #fff 66%),
+    linear-gradient(84deg, #000 18%, #fff 33%),
+    linear-gradient(62deg, #000 47%, #fff 63%);
+  background-blend-mode: difference;
 }
 
-/* ---------- Header Bar ---------- */
+.note-inner::before {
+  opacity: 0.08;
+}
+
+.note-inner::after {
+  filter: invert(1);
+  opacity: 0.04;
+  top: 1px;
+  left: 1px;
+  right: -1px;
+  bottom: -1px;
+}
+
+/* ---------- Header Bar (Tape) ---------- */
 
 .note-header {
   display: flex;
   align-items: center;
   padding: 5px 6px 5px 4px;
-  min-height: 32px;
+  height: 3em;
+  margin: 0 20px;
   position: relative;
   z-index: 2;
-  background: rgba(0, 0, 0, 0.03);
-  border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+  /* Tape appearance */
+  background-color: hsla(0, 0%, 100%, 0.2);
+  box-shadow: inset 0 0 1em 0.5em hsla(0, 0%, 100%, 0.1);
+  -webkit-filter: drop-shadow(0 1px 1px hsla(0, 0%, 0%, 0.3));
+  filter: drop-shadow(0 1px 1px hsla(0, 0%, 0%, 0.3));
+}
+
+/* Torn tape edges */
+.note-header::after,
+.note-header::before {
+  background-size: 0.4em 0.4em;
+  bottom: 0;
+  content: "";
+  position: absolute;
+  top: 0;
+  width: 0.2em;
+  z-index: 3;
+  pointer-events: none;
+}
+
+.note-header::after {
+  background-image: linear-gradient(45deg, transparent 50%, hsla(0, 0%, 100%, 0.3) 50%),
+                    linear-gradient(-45deg, transparent 50%, hsla(0, 0%, 100%, 0.3) 50%);
+  background-position: 0 100%;
+  left: -.2em;
+}
+
+.note-header::before {
+  background-image: linear-gradient(135deg, transparent 50%, hsla(0, 0%, 100%, 0.3) 50%),
+                    linear-gradient(-135deg, transparent 50%, hsla(0, 0%, 100%, 0.3) 50%);
+  background-position: 100% 100%;
+  right: -.2em;
 }
 
 /* ---------- Drag Grip (left) ---------- */
@@ -149,8 +212,9 @@
 .note-title {
   flex: 1;
   text-align: left;
-  font-family: "Permanent Marker", cursive;
-  font-size: 14px;
+  font-family: "Indie Flower", cursive;
+  font-size: 20px;
+  font-weight: 600;
   color: rgba(0, 0, 0, 0.6);
   outline: none;
   padding: 2px 6px;
@@ -296,15 +360,15 @@
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  font-size: 11px;
+  font-size: 20px;
   color: rgba(0, 0, 0, 0.6);
 }
 
 /* Todo text */
 .todo-text {
   flex: 1;
-  font-family: "Permanent Marker", cursive;
-  font-size: 14px;
+  font-family: "Indie Flower", cursive;
+  font-size: 20px;
   color: rgba(0, 0, 0, 0.6);
   line-height: 1.5;
   overflow: hidden;
@@ -353,15 +417,15 @@
   text-align: center;
   font-size: 14px;
   color: rgba(0, 0, 0, 0.15);
-  font-family: "Permanent Marker", cursive;
+  font-family: "Indie Flower", cursive;
 }
 
 .todo-new-input {
   flex: 1;
   border: none;
   background: transparent;
-  font-family: "Permanent Marker", cursive;
-  font-size: 14px;
+  font-family: "Indie Flower", cursive;
+  font-size: 20px;
   color: rgba(0, 0, 0, 0.6);
   outline: none;
   padding: 0;
@@ -386,7 +450,7 @@
 }
 
 .note-fade-top {
-  top: 32px;
+  top: 3em;
   background: linear-gradient(to bottom, rgba(0, 0, 0, 0.06), transparent);
 }
 

@@ -561,8 +561,8 @@ async fn create_note(app: tauri::AppHandle) -> Result<Note, String> {
         title: "ToDo".to_string(),
         x: x.max(0.0),
         y: y.max(0.0),
-        width: 300.0,
-        height: 200.0,
+        width: 400.0,
+        height: 450.0,
         color,
         todo_ids: Vec::new(),
     };
