@@ -284,6 +284,7 @@ def monitor_loop():
 
     REMINDER_URL = "http://127.0.0.1:8766/remind"
     SLIDE_UP_URL = "http://127.0.0.1:8766/slide-up"
+    SLIDE_LEFT_URL = "http://127.0.0.1:8766/slide-left"
 
     last_title = None
     last_url = None
@@ -326,6 +327,20 @@ def monitor_loop():
             # On CONTEXT CHANGE: FIRST slide up immediately
             # Don't slide up on URL/title changes within the same context
             if context_changed:
+                # Slide todo popup windows left off-screen
+                try:
+                    req = urllib.request.Request(
+                        SLIDE_LEFT_URL,
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    urllib.request.urlopen(req, timeout=2)
+                except Exception:
+                    pass
+                # Wait for slide-left animation to finish
+                time.sleep(0.35)
+                # Slide reminder window up off-screen
                 if is_window_down:
                     try:
                         req = urllib.request.Request(

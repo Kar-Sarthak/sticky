@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import NoteWindow from "./components/NoteWindow";
 import PreferencesWindow from "./components/PreferencesWindow";
 import ReminderWindow from "./components/ReminderWindow";
+import TodoPopupWindow from "./components/TodoPopupWindow";
 import "./styles/global.css";
 
 const currentWindow = getCurrentWindow();
@@ -18,6 +19,8 @@ if (label.startsWith("note-") || hash.startsWith("#note-")) {
   App = PreferencesWindow;
 } else if (label === "reminder" || hash === "#reminder") {
   App = ReminderWindow;
+} else if (label.startsWith("todo-popup-") || hash.startsWith("#todo-popup")) {
+  App = TodoPopupWindow;
 } else {
   // Should never happen since no main window is configured
   App = () => <div style={{ padding: 20 }}>No UI loaded</div>;
