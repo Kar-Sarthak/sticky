@@ -283,7 +283,6 @@ def monitor_loop():
     import urllib.request
 
     REMINDER_URL = "http://127.0.0.1:8766/remind"
-    SLIDE_UP_URL = "http://127.0.0.1:8766/slide-up"
     SLIDE_LEFT_URL = "http://127.0.0.1:8766/slide-left"
 
     last_title = None
@@ -291,8 +290,6 @@ def monitor_loop():
     last_process = None
     last_contexts = []
     last_todo_ids = []
-    own_window_active = False
-    is_window_down = False  # Track if reminder window is currently visible
 
     print("\n🔍 Window monitor active — watching active window...")
 
@@ -308,15 +305,8 @@ def monitor_loop():
             is_own_window = process in OWN_APP_PROCESSES
 
             if is_own_window:
-                # Our app has focus — don't change the reminder, just keep polling
-                if not own_window_active:
-                    own_window_active = True
-                    print(f"  [own window active — keeping current context]", flush=True)
                 time.sleep(POLL_INTERVAL)
                 continue
-            else:
-                if own_window_active:
-                    own_window_active = False
 
             # Detect context (URL + process mapping)
             active_contexts, url = detect_current_contexts(title, process, hwnd)
@@ -324,8 +314,7 @@ def monitor_loop():
             # Check if the CONTEXT SET changed (not just URL/title within same context)
             context_changed = set(active_contexts) != set(last_contexts)
 
-            # On CONTEXT CHANGE: FIRST slide up immediately
-            # Don't slide up on URL/title changes within the same context
+            # On CONTEXT CHANGE: FIRST slide popup windows left off-screen
             if context_changed:
                 # Slide todo popup windows left off-screen
                 try:
@@ -340,19 +329,6 @@ def monitor_loop():
                     pass
                 # Wait for slide-left animation to finish
                 time.sleep(0.35)
-                # Slide reminder window up off-screen
-                if is_window_down:
-                    try:
-                        req = urllib.request.Request(
-                            SLIDE_UP_URL,
-                            data=b"{}",
-                            headers={"Content-Type": "application/json"},
-                            method="POST",
-                        )
-                        urllib.request.urlopen(req, timeout=2)
-                        is_window_down = False
-                    except Exception:
-                        pass
                 # Update tracking state
                 last_contexts = active_contexts
                 last_todo_ids = []
@@ -408,7 +384,6 @@ def monitor_loop():
                             method="POST",
                         )
                         urllib.request.urlopen(req, timeout=2)
-                        is_window_down = True
                     except Exception as e:
                         print(f"  [reminder] Failed to send: {e}", flush=True)
 

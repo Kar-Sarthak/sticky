@@ -3,7 +3,7 @@ mod models;
 use models::{Note, TodoItem};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::Manager;
@@ -25,17 +25,6 @@ struct GlobalShortcutState {
 /// Close/hide on a single window doesn't change this — only the hotkey toggles it.
 struct NotesVisibility {
     notes_visible: Mutex<bool>,
-}
-
-/// Tracks whether the reminder window has todos loaded (for peek-on-slide-up behavior).
-struct ReminderHasTodos {
-    has_todos: AtomicBool,
-}
-
-/// Generation counter to cancel stale bounces when the context changes.
-/// Incremented on /slide-up; bounce sleeps then checks if generation still matches.
-struct ReminderBounceGen {
-    gen: AtomicU32,
 }
 
 /// Tracks whether popup bounce is active (for hover-to-reveal interruption).
@@ -665,176 +654,6 @@ async fn note_hidden(app: tauri::AppHandle, is_destroying: bool) {
     }
 }
 
-// ─── Reminder Window ───
-
-/// Off-screen Y position (fully hidden, no shadow visible)
-const REMINDER_OFF_SCREEN_Y: f64 = -300.0;
-/// Bounce base Y: position where the bounce animation hovers (~30px visible at screen edge)
-const REMINDER_BOUNCE_BASE_Y: f64 = -260.0;
-/// Peek Y: position showing bottom 10px of window (window is 200px tall)
-const REMINDER_PEEK_Y: f64 = -240.0;
-
-/// On-screen Y position (visible at top of screen)
-const REMINDER_ON_SCREEN_Y: f64 = -1.0;
-
-/// Animate window Y position from `from_y` to `to_y` in steps.
-fn animate_window_y(app: &tauri::AppHandle, from_y: f64, to_y: f64) {
-    let win = match app.get_webview_window("reminder") {
-        Some(w) => w,
-        None => return,
-    };
-
-    let steps = 20;
-    let total_distance = to_y - from_y;
-    let step_delay = std::time::Duration::from_millis(15);
-
-    for i in 1..=steps {
-        let progress = i as f64 / steps as f64;
-        // Ease-out cubic for smooth deceleration
-        let eased = 1.0 - (1.0 - progress).powi(3);
-        let current_y = from_y + total_distance * eased;
-
-        // Get current X position (keep it unchanged)
-        let x = match win.outer_position() {
-            Ok(pos) => pos.x,
-            Err(_) => 830,
-        };
-
-        win.set_position(tauri::PhysicalPosition::new(x, current_y as i32)).ok();
-        std::thread::sleep(step_delay);
-    }
-}
-
-/// Spawn the reminder window (once, at startup).
-/// Starts off-screen so it's not visible until todos arrive.
-fn spawn_reminder_window(app: &tauri::AppHandle) {
-    if app.get_webview_window("reminder").is_some() {
-        return;
-    }
-
-    // Position centered horizontally, but off-screen vertically
-    let x = match app.primary_monitor() {
-        Ok(Some(monitor)) => {
-            let size = monitor.size();
-            let scale = monitor.scale_factor();
-            (size.width as f64 / scale - 260.0) / 2.0
-        }
-        _ => 830.0, // fallback
-    };
-
-    tauri::WebviewWindowBuilder::new(
-        app,
-        "reminder",
-        tauri::WebviewUrl::App("index.html#reminder".into()),
-    )
-    .title("Reminders")
-    .inner_size(260.0, 200.0)
-    .position(x, REMINDER_OFF_SCREEN_Y)
-    .resizable(false)
-    .decorations(false)
-    .transparent(true)
-    .always_on_top(true)
-    .skip_taskbar(true)
-    .build()
-    .ok();
-
-    // Force off-screen position again to override any OS clamping
-    if let Some(win) = app.get_webview_window("reminder") {
-        win.set_position(tauri::PhysicalPosition::new(x as i32, REMINDER_OFF_SCREEN_Y as i32)).ok();
-    }
-}
-
-/// Check if there are any undone todos for the given contexts. If not, slide the reminder up.
-#[tauri::command]
-async fn check_context_todos_and_slide(app: tauri::AppHandle, contexts: Vec<String>) -> Result<bool, String> {
-    // Load contexts.json
-    let ctx_map = get_contexts(&app)?;
-
-    // Find all todo IDs matching the given contexts
-    let mut matching_todo_ids = Vec::new();
-    for ctx in &contexts {
-        let ctx_lower = ctx.to_lowercase();
-        for (key, ids) in &ctx_map {
-            if key.to_lowercase() == ctx_lower || key.to_lowercase().contains(&ctx_lower) || ctx_lower.contains(&key.to_lowercase()) {
-                matching_todo_ids.extend(ids.clone());
-            }
-        }
-    }
-
-    // Load todos.json and check how many matching todos are undone
-    let todos = get_all_todos(&app)?;
-    let undone_count = todos.iter().filter(|t| {
-        matching_todo_ids.contains(&t.id) && t.status != "done"
-    }).count();
-
-    if undone_count == 0 {
-        clear_reminder(&app, true);
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
-/// Clear the reminder window — slides back up off-screen.
-/// `clear_todos` — true when there are genuinely no todos left (clears the peek flag).
-///                  false for temporary slide-ups like mouse-leave (preserves the peek flag).
-fn clear_reminder(app: &tauri::AppHandle, clear_todos: bool) {
-    // Stop any ongoing bounce
-    stop_bounce(app);
-
-    // Bump generation to cancel any pending delayed bounce
-    if let Some(state) = app.try_state::<Arc<ReminderBounceGen>>() {
-        state.gen.fetch_add(1, Ordering::SeqCst);
-    }
-
-    // For temporary hover-hide: only animate if window is currently down
-    // For genuine todo clears: always run regardless of current state
-    if !clear_todos {
-        if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
-            if state.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-                return;
-            }
-        }
-    } else {
-        // Force the flag to false (window is now up)
-        if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
-            state.store(false, Ordering::SeqCst);
-        }
-    }
-
-    // Read peek flag (only clear it if todos are genuinely gone)
-    let peek_val = if clear_todos {
-        // Clear the flag so no peek happens after this
-        app.try_state::<Arc<ReminderHasTodos>>()
-            .map(|s| { s.has_todos.store(false, Ordering::SeqCst); s.has_todos.load(Ordering::SeqCst) })
-            .unwrap_or(false)
-    } else {
-        app.try_state::<Arc<ReminderHasTodos>>()
-            .map(|s| s.has_todos.load(Ordering::SeqCst))
-            .unwrap_or(false)
-    };
-
-    // Get current Y so we slide up from wherever the window is
-    let app = app.clone();
-    std::thread::spawn(move || {
-        if let Some(win) = app.get_webview_window("reminder") {
-            // Clear frontend todo data only when todos are genuinely gone
-            if clear_todos {
-                let payload = serde_json::json!({ "todos": [], "context": "" });
-                win.emit("reminder-data", payload).ok();
-            }
-            // Get current Y so we slide up from wherever the window is
-            let current_y = win.outer_position().map(|p| p.y as f64).unwrap_or(REMINDER_ON_SCREEN_Y);
-            let from_y = current_y.max(REMINDER_OFF_SCREEN_Y);
-            animate_window_y(&app, from_y, REMINDER_OFF_SCREEN_Y);
-            // After sliding up, slide back down to show bottom 10px peek (only if flag was set)
-            if peek_val {
-                animate_window_y(&app, REMINDER_OFF_SCREEN_Y, REMINDER_PEEK_Y);
-            }
-        }
-    });
-}
-
 // ─── Todo Popup Windows ───
 
 const TODO_POPUP_WIDTH: f64 = 300.0;
@@ -960,7 +779,7 @@ fn spawn_todo_popup_windows(app: &tauri::AppHandle, todos: &[TodoItem]) {
         }
     }
 
-    // Start bounce animation for all popup windows (after 200ms delay)
+    // Start bounce animation for all popup windows (after 3s delay, matching reminder)
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(3));
@@ -1025,65 +844,6 @@ fn start_popup_bounce(app: &tauri::AppHandle) {
     });
 }
 
-// ─── Reminder Window Bounce ───
-
-/// Stop the bounce animation (called before slide-down or slide-up).
-fn stop_bounce(app: &tauri::AppHandle) {
-    if let Some(state) = app.try_state::<Arc<AtomicU8>>() {
-        state.store(0, Ordering::SeqCst);
-    }
-}
-
-/// Start a continuous bounce loop: Y oscillates between -250 and -220 in a smooth cycle.
-fn start_bounce(app: &tauri::AppHandle) {
-    // Stop any existing bounce first
-    stop_bounce(app);
-
-    // Set the bounce flag to true
-    if let Some(state) = app.try_state::<Arc<AtomicU8>>() {
-        state.store(1, Ordering::SeqCst);
-    }
-
-    // Also set the reminder visibility flag to true so clear_reminder() can slide up
-    if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
-        state.store(true, Ordering::SeqCst);
-    }
-
-    let app = app.clone();
-    std::thread::spawn(move || {
-        let win = match app.get_webview_window("reminder") {
-            Some(w) => w,
-            None => return,
-        };
-
-        // Get current X so we can restore it
-        let current_pos = win.outer_position().unwrap_or(tauri::PhysicalPosition::new(0, 0));
-        let x = current_pos.x;
-
-        let base_y = REMINDER_BOUNCE_BASE_Y;
-        let amplitude = 30.0; // bounce 30px down
-
-        // Bounce for exactly 5 cycles, then slide to peek
-        for _cycle in 0..5 {
-            for step in 0..60 {
-                if let Some(state) = app.try_state::<Arc<AtomicU8>>() {
-                    if state.load(Ordering::SeqCst) == 0 {
-                        return;
-                    }
-                }
-                let t = (step as f64) / 60.0;
-                let offset = amplitude * (1.0 - (2.0 * std::f64::consts::PI * t).cos()) / 2.0;
-                let y = base_y + offset;
-                win.set_position(tauri::PhysicalPosition::new(x, y as i32)).ok();
-                std::thread::sleep(std::time::Duration::from_millis(16));
-            }
-        }
-
-        // After 5 bounces, slide to peek
-        clear_reminder(&app, false);
-    });
-}
-
 // ─── HTTP Server for Python Monitor ───
 
 const REMINDER_SERVER_PORT: u16 = 8766;
@@ -1116,57 +876,77 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
     use tiny_http::{Method, Response};
     use std::io::Cursor;
 
-    // Handle /slide-up: slide window up off-screen (Python monitor — clears frontend data)
-    if request.method() == &Method::Post && request.url() == "/slide-up" {
-        let app = app.clone();
-        std::thread::spawn(move || {
-            clear_reminder(&app, true);
-        });
-        let resp_body = Cursor::new(b"{\"status\":\"sliding-up\"}");
-        let _ = request.respond(Response::new(
-            tiny_http::StatusCode(200),
-            Vec::new(),
-            resp_body,
-            None,
-            None,
-        ));
-        return;
-    }
+    // Handle /slide-left: animate all todo popup windows left off-screen, then destroy them
+    if request.method() == &Method::Post && request.url() == "/slide-left" {
+        // Stop any running popup bounce
+        stop_popup_bounce(&app);
 
-    // Handle /hover-hide: slide window up but preserve frontend data (for mouse-leave)
-    if request.method() == &Method::Post && request.url() == "/hover-hide" {
-        let app = app.clone();
-        std::thread::spawn(move || {
-            clear_reminder(&app, false);
-        });
-        let resp_body = Cursor::new(b"{\"status\":\"hover-hiding\"}");
-        let _ = request.respond(Response::new(
-            tiny_http::StatusCode(200),
-            Vec::new(),
-            resp_body,
-            None,
-            None,
-        ));
-        return;
-    }
+        // Collect popup labels first so we don't hold the lock during animation
+        let popup_labels: Vec<String> = app
+            .webview_windows()
+            .iter()
+            .filter(|(label, _)| label.starts_with("todo-popup-"))
+            .map(|(label, _)| label.to_string())
+            .collect();
 
-    // Handle /slide-down: slide window down to y=-1 (animation only, no data)
-    if request.method() == &Method::Post && request.url() == "/slide-down" {
-        stop_bounce(&app);
-        // Set visibility flag
-        if let Some(state) = app.try_state::<Arc<AtomicBool>>() {
-            state.store(true, Ordering::SeqCst);
+        for label in popup_labels {
+            slide_left_todo_popup(&app, &label);
         }
-        let app = app.clone();
-        std::thread::spawn(move || {
-            if let Some(win) = app.get_webview_window("reminder") {
-                let from_y = win.outer_position()
-                    .map(|p| (p.y as f64).max(REMINDER_OFF_SCREEN_Y))
-                    .unwrap_or(REMINDER_OFF_SCREEN_Y);
-                animate_window_y(&app, from_y, REMINDER_ON_SCREEN_Y);
+
+        let resp_body = Cursor::new(b"{\"status\":\"sliding-left\"}");
+        let _ = request.respond(Response::new(
+            tiny_http::StatusCode(200),
+            Vec::new(),
+            resp_body,
+            None,
+            None,
+        ));
+        return;
+    }
+
+    // Handle /slide-left-popup: slide all popup windows back to x=-380 (context change / force hide)
+    if request.method() == &Method::Post && request.url() == "/slide-left-popup" {
+        // Clear expanded flag and stop bounce to kill any running polling/bounce threads
+        if let Some(state) = app.try_state::<Arc<PopupExpanded>>() {
+            state.expanded.store(false, Ordering::SeqCst);
+        }
+        stop_popup_bounce(&app);
+
+        let popup_labels: Vec<String> = app
+            .webview_windows()
+            .iter()
+            .filter(|(label, _)| label.starts_with("todo-popup-"))
+            .map(|(label, _)| label.to_string())
+            .collect();
+
+        for label in &popup_labels {
+            if let Some(win) = app.get_webview_window(label) {
+                let from_x = match win.outer_position() {
+                    Ok(pos) => pos.x as f64,
+                    Err(_) => -20.0,
+                };
+                let label = label.clone();
+                let app = app.clone();
+                std::thread::spawn(move || {
+                    let steps = 20;
+                    let total_distance = -380.0 - from_x;
+                    let step_delay = std::time::Duration::from_millis(15);
+                    for i in 1..=steps {
+                        let progress = i as f64 / steps as f64;
+                        let eased = 1.0 - (1.0 - progress).powi(3);
+                        let current_x = from_x + total_distance * eased;
+                        if let Some(win) = app.get_webview_window(&label) {
+                            if let Ok(pos) = win.outer_position() {
+                                win.set_position(tauri::PhysicalPosition::new(current_x as i32, pos.y as i32)).ok();
+                            }
+                        }
+                        std::thread::sleep(step_delay);
+                    }
+                });
             }
-        });
-        let resp_body = Cursor::new(b"{\"status\":\"sliding-down\"}");
+        }
+
+        let resp_body = Cursor::new(b"{\"status\":\"sliding-left-popup\"}");
         let _ = request.respond(Response::new(
             tiny_http::StatusCode(200),
             Vec::new(),
@@ -1222,7 +1002,7 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
             }
         }
 
-        // Spawn polling thread: every 500ms check if cursor is over any popup
+        // Spawn polling thread: every 1s check if cursor is over any popup
         let popup_labels_clone = popup_labels.clone();
         let app_clone = app.clone();
         std::thread::spawn(move || {
@@ -1325,87 +1105,6 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
         return;
     }
 
-    // Handle /slide-left-popup: slide all popup windows back to x=-380 (context change / force hide)
-    if request.method() == &Method::Post && request.url() == "/slide-left-popup" {
-        // Clear expanded flag and stop bounce to kill any running polling/bounce threads
-        if let Some(state) = app.try_state::<Arc<PopupExpanded>>() {
-            state.expanded.store(false, Ordering::SeqCst);
-        }
-        stop_popup_bounce(&app);
-
-        let popup_labels: Vec<String> = app
-            .webview_windows()
-            .iter()
-            .filter(|(label, _)| label.starts_with("todo-popup-"))
-            .map(|(label, _)| label.to_string())
-            .collect();
-
-        for label in &popup_labels {
-            if let Some(win) = app.get_webview_window(label) {
-                let from_x = match win.outer_position() {
-                    Ok(pos) => pos.x as f64,
-                    Err(_) => -20.0,
-                };
-                let label = label.clone();
-                let app = app.clone();
-                std::thread::spawn(move || {
-                    let steps = 20;
-                    let total_distance = -380.0 - from_x;
-                    let step_delay = std::time::Duration::from_millis(15);
-                    for i in 1..=steps {
-                        let progress = i as f64 / steps as f64;
-                        let eased = 1.0 - (1.0 - progress).powi(3);
-                        let current_x = from_x + total_distance * eased;
-                        if let Some(win) = app.get_webview_window(&label) {
-                            if let Ok(pos) = win.outer_position() {
-                                win.set_position(tauri::PhysicalPosition::new(current_x as i32, pos.y as i32)).ok();
-                            }
-                        }
-                        std::thread::sleep(step_delay);
-                    }
-                });
-            }
-        }
-
-        let resp_body = Cursor::new(b"{\"status\":\"sliding-left-popup\"}");
-        let _ = request.respond(Response::new(
-            tiny_http::StatusCode(200),
-            Vec::new(),
-            resp_body,
-            None,
-            None,
-        ));
-        return;
-    }
-
-    // Handle /slide-left: animate all todo popup windows left off-screen, then destroy them
-    if request.method() == &Method::Post && request.url() == "/slide-left" {
-        // Stop any running popup bounce
-        stop_popup_bounce(&app);
-
-        // Collect popup labels first so we don't hold the lock during animation
-        let popup_labels: Vec<String> = app
-            .webview_windows()
-            .iter()
-            .filter(|(label, _)| label.starts_with("todo-popup-"))
-            .map(|(label, _)| label.to_string())
-            .collect();
-
-        for label in popup_labels {
-            slide_left_todo_popup(&app, &label);
-        }
-
-        let resp_body = Cursor::new(b"{\"status\":\"sliding-left\"}");
-        let _ = request.respond(Response::new(
-            tiny_http::StatusCode(200),
-            Vec::new(),
-            resp_body,
-            None,
-            None,
-        ));
-        return;
-    }
-
     // Only accept POST to /remind
     if request.method() != &Method::Post || request.url() != "/remind" {
         let body = Cursor::new(b"{}");
@@ -1434,67 +1133,21 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
         }
     };
 
-    // Extract todos and context
+    // Extract todos and spawn popup windows
     if let Some(todos) = payload["todos"].as_array() {
         let todos: Vec<serde_json::Value> = todos.iter().cloned().collect();
-        let context = payload["context"].as_str().unwrap_or("").to_string();
-        if !todos.is_empty() {
-            // Send todo data to the frontend for display
-            if let Some(win) = app.get_webview_window("reminder") {
-                let undone: Vec<&serde_json::Value> = todos.iter()
-                    .filter(|t| t.get("status").and_then(|s| s.as_str()) != Some("done"))
-                    .collect();
-                if !undone.is_empty() {
-                    let payload = serde_json::json!({ "todos": undone, "context": context });
-                    win.emit("reminder-data", payload).ok();
-
-                    // Spawn popup windows for each undone todo
-                    let popup_todos: Vec<TodoItem> = undone
-                        .iter()
-                        .filter_map(|t| serde_json::from_value::<TodoItem>((*t).clone()).ok())
-                        .collect();
-                    if !popup_todos.is_empty() {
-                        spawn_todo_popup_windows(&app, &popup_todos);
-                    }
-
-                    // Set peek flag so clear_reminder knows to leave a peek
-                    if let Some(state) = app.try_state::<Arc<ReminderHasTodos>>() {
-                        state.has_todos.store(true, Ordering::SeqCst);
-                    }
-                    // Wait 3 seconds before bouncing — allows Python monitor to
-                    // detect another context switch and cancel via /slide-up
-                    let captured_gen = app.try_state::<Arc<ReminderBounceGen>>()
-                        .map(|s| s.gen.load(Ordering::SeqCst))
-                        .unwrap_or(0);
-                    let app = app.clone();
-                    std::thread::spawn(move || {
-                        std::thread::sleep(std::time::Duration::from_secs(3));
-                        // If generation changed, a /slide-up happened — skip stale bounce
-                        let still_valid = app.try_state::<Arc<ReminderBounceGen>>()
-                            .map(|s| s.gen.load(Ordering::SeqCst) == captured_gen)
-                            .unwrap_or(false);
-                        if still_valid {
-                            start_bounce(&app);
-                        }
-                    });
-                } else {
-                    if let Some(state) = app.try_state::<Arc<ReminderHasTodos>>() {
-                        state.has_todos.store(false, Ordering::SeqCst);
-                    }
-                    clear_reminder(app, true);
-                }
+        let undone: Vec<&serde_json::Value> = todos.iter()
+            .filter(|t| t.get("status").and_then(|s| s.as_str()) != Some("done"))
+            .collect();
+        if !undone.is_empty() {
+            let popup_todos: Vec<TodoItem> = undone
+                .iter()
+                .filter_map(|t| serde_json::from_value::<TodoItem>((*t).clone()).ok())
+                .collect();
+            if !popup_todos.is_empty() {
+                spawn_todo_popup_windows(&app, &popup_todos);
             }
-        } else {
-            if let Some(state) = app.try_state::<Arc<ReminderHasTodos>>() {
-                state.has_todos.store(false, Ordering::SeqCst);
-            }
-            clear_reminder(app, true);
         }
-    } else {
-        if let Some(state) = app.try_state::<Arc<ReminderHasTodos>>() {
-            state.has_todos.store(false, Ordering::SeqCst);
-        }
-        clear_reminder(app, true);
     }
 
     let resp_body = Cursor::new(b"{\"status\":\"ok\"}");
@@ -1577,9 +1230,6 @@ pub fn run() {
             // Spawn the Python context classifier server
             spawn_context_server();
 
-            // --- Spawn the reminder window (single, always exists) ---
-            spawn_reminder_window(app.handle());
-
             // --- Start HTTP server for Python monitor ---
             start_reminder_http_server(app.handle().clone());
 
@@ -1641,12 +1291,6 @@ pub fn run() {
                 notes_visible: Mutex::new(true),
             });
 
-            // Track reminder window state (false = up/off-screen, true = down/visible)
-            app.manage(Arc::new(AtomicBool::new(false)));
-
-            // Track bounce loop state (0 = not bouncing, 1 = bouncing)
-            app.manage(Arc::new(AtomicU8::new(0)));
-
             // Track popup bounce active flag
             app.manage(Arc::new(PopupBounceActive { active: AtomicBool::new(false) }));
 
@@ -1654,12 +1298,6 @@ pub fn run() {
             app.manage(Arc::new(PopupExpanded {
                 expanded: AtomicBool::new(false),
             }));
-
-            // Track whether reminder has todos loaded (controls peek-on-slide-up)
-            app.manage(Arc::new(ReminderHasTodos { has_todos: AtomicBool::new(false) }));
-
-            // Track bounce generation (incremented on /slide-up to cancel stale bounces)
-            app.manage(Arc::new(ReminderBounceGen { gen: AtomicU32::new(0) }));
 
             // --- Tray icon & menu ---
             let menu = Menu::with_items(
@@ -1720,7 +1358,6 @@ pub fn run() {
             delete_todo,
             delete_note_todos,
             get_note_todos,
-            check_context_todos_and_slide,
             slide_left_and_destroy_popup
         ])
         .run(tauri::generate_context!())
