@@ -47,6 +47,14 @@ struct PopupExpanded {
     slide_in_progress: AtomicBool,
 }
 
+/// Generation counter for popup slide animations. Incremented on every
+/// slide command (/slide-right, /slide-left, /slide-left-popup, checkbox destroy).
+/// Old slide threads check this inside their loop and abort if stale —
+/// prevents the "tug-of-war" when a new slide command arrives mid-animation.
+struct PopupSlideGen {
+    gen: AtomicU32,
+}
+
 /// Maps popup label → measured height. Used to compute dynamic Y positions
 /// with correct gaps when each popup reports its size after font loading.
 struct PopupHeights {
@@ -725,6 +733,10 @@ fn slide_left_todo_popup(app: &tauri::AppHandle, label: &str) {
         Err(_) => 0.0,
     };
 
+    // Capture current generation — abort if a newer slide command arrives
+    let captured_gen = app.try_state::<Arc<PopupSlideGen>>()
+        .map(|g| g.gen.load(Ordering::SeqCst));
+
     let label = label.to_string();
     let app = app.clone();
     std::thread::spawn(move || {
@@ -733,6 +745,12 @@ fn slide_left_todo_popup(app: &tauri::AppHandle, label: &str) {
         let step_delay = std::time::Duration::from_millis(15);
 
         for i in 1..=steps {
+            // Abort if a newer slide command invalidated us
+            if let Some(gen) = captured_gen {
+                if let Some(state) = app.try_state::<Arc<PopupSlideGen>>() {
+                    if state.gen.load(Ordering::SeqCst) != gen { return; }
+                }
+            }
             let progress = i as f64 / steps as f64;
             let eased = 1.0 - (1.0 - progress).powi(3);
             let current_x = from_x + total_distance * eased;
@@ -945,6 +963,10 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
 
     // Handle /slide-left-popup: slide all popup windows back to x=-380 (context change / force hide)
     if request.method() == &Method::Post && request.url() == "/slide-left-popup" {
+        // Bump slide gen to kill any running slide threads
+        if let Some(gen) = app.try_state::<Arc<PopupSlideGen>>() {
+            gen.gen.fetch_add(1, Ordering::SeqCst);
+        }
         // Clear expanded flag, reset polling guard, and stop bounce to kill any running polling/bounce threads
         if let Some(state) = app.try_state::<Arc<PopupExpanded>>() {
             state.expanded.store(false, Ordering::SeqCst);
@@ -960,6 +982,10 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
             .map(|(label, _)| label.to_string())
             .collect();
 
+        // Capture generation for cancellation
+        let captured_gen = app.try_state::<Arc<PopupSlideGen>>()
+            .map(|g| g.gen.load(Ordering::SeqCst));
+
         for label in &popup_labels {
             if let Some(win) = app.get_webview_window(label) {
                 let from_x = match win.outer_position() {
@@ -973,6 +999,12 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
                     let total_distance = -380.0 - from_x;
                     let step_delay = std::time::Duration::from_millis(15);
                     for i in 1..=steps {
+                        // Abort if a newer slide command invalidated us
+                        if let Some(gen) = captured_gen {
+                            if let Some(state) = app.try_state::<Arc<PopupSlideGen>>() {
+                                if state.gen.load(Ordering::SeqCst) != gen { return; }
+                            }
+                        }
                         let progress = i as f64 / steps as f64;
                         let eased = 1.0 - (1.0 - progress).powi(3);
                         let current_x = from_x + total_distance * eased;
@@ -1072,13 +1104,58 @@ fn poll_popup_hover(app: Arc<tauri::AppHandle>, popup_labels: Vec<String>) {
             }
             std::thread::sleep(std::time::Duration::from_millis(300));
 
-            // Check if mouse re-entered during grace period
+            // Failsafe: re-check actual cursor position after grace period.
+            // Even if the frontend swallowed the mouseenter event (animLockRef debounce),
+            // the physical cursor might be back over the popups — don't dismiss in that case.
+            {
+                #[repr(C)]
+                struct POINT { x: i32, y: i32 }
+                extern "system" { fn GetCursorPos(lpPoint: *mut POINT) -> i32; }
+                let mut pt = POINT { x: 0, y: 0 };
+                let ok = unsafe { GetCursorPos(&mut pt) };
+                if ok != 0 {
+                    let mut min_x = i32::MAX;
+                    let mut max_x = i32::MIN;
+                    let mut min_y = i32::MAX;
+                    let mut max_y = i32::MIN;
+                    for label in &popup_labels {
+                        if let Some(win) = app.get_webview_window(label) {
+                            if let (Ok(pos), Ok(size)) = (win.outer_position(), win.inner_size()) {
+                                let wx = pos.x as i32;
+                                let wy = pos.y as i32;
+                                let ww = size.width as i32;
+                                let wh = size.height as i32;
+                                if wx < min_x { min_x = wx; }
+                                if wx + ww > max_x { max_x = wx + ww; }
+                                if wy < min_y { min_y = wy; }
+                                if wy + wh > max_y { max_y = wy + wh; }
+                            }
+                        }
+                    }
+                    if pt.x >= min_x && pt.x <= max_x && pt.y >= min_y && pt.y <= max_y {
+                        // Cursor physically returned — re-expand and keep polling
+                        if let Some(state) = app.try_state::<Arc<PopupExpanded>>() {
+                            state.expanded.store(true, Ordering::SeqCst);
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            // Double-check the expanded flag (frontend might have sent /slide-right)
             let still_expanded = app.try_state::<Arc<PopupExpanded>>()
                 .map(|s| s.expanded.load(Ordering::SeqCst))
                 .unwrap_or(false);
             if still_expanded {
                 continue; // Mouse came back, keep polling, don't slide
             }
+
+            // Bump slide gen to kill any existing slide threads before spawning new ones
+            if let Some(gen) = app.try_state::<Arc<PopupSlideGen>>() {
+                gen.gen.fetch_add(1, Ordering::SeqCst);
+            }
+            let captured_gen = app.try_state::<Arc<PopupSlideGen>>()
+                .map(|g| g.gen.load(Ordering::SeqCst));
 
             // Slide all popups back to -380
             for label in &popup_labels {
@@ -1094,6 +1171,12 @@ fn poll_popup_hover(app: Arc<tauri::AppHandle>, popup_labels: Vec<String>) {
                         let total_distance = -380.0 - from_x;
                         let step_delay = std::time::Duration::from_millis(15);
                         for i in 1..=steps {
+                            // Abort if a newer slide command invalidated us
+                            if let Some(gen) = captured_gen {
+                                if let Some(state) = app.try_state::<Arc<PopupSlideGen>>() {
+                                    if state.gen.load(Ordering::SeqCst) != gen { return; }
+                                }
+                            }
                             let progress = i as f64 / steps as f64;
                             let eased = 1.0 - (1.0 - progress).powi(3);
                             let current_x = from_x + total_distance * eased;
@@ -1127,6 +1210,11 @@ fn poll_popup_hover(app: Arc<tauri::AppHandle>, popup_labels: Vec<String>) {
             state.slide_in_progress.store(false, Ordering::SeqCst);
         }
 
+        // Bump slide gen to kill any existing slide threads (slide-back, slide-left-popup)
+        if let Some(gen) = app.try_state::<Arc<PopupSlideGen>>() {
+            gen.gen.fetch_add(1, Ordering::SeqCst);
+        }
+
         // Stop popup bounce
         stop_popup_bounce(&app);
 
@@ -1136,6 +1224,10 @@ fn poll_popup_hover(app: Arc<tauri::AppHandle>, popup_labels: Vec<String>) {
             .filter(|(label, _)| label.starts_with("todo-popup-"))
             .map(|(label, _)| label.to_string())
             .collect();
+
+        // Capture generation for cancellation
+        let captured_gen = app.try_state::<Arc<PopupSlideGen>>()
+            .map(|g| g.gen.load(Ordering::SeqCst));
 
         // Slide all popups to x=-20
         for label in &popup_labels {
@@ -1151,6 +1243,12 @@ fn poll_popup_hover(app: Arc<tauri::AppHandle>, popup_labels: Vec<String>) {
                     let total_distance = -20.0 - from_x;
                     let step_delay = std::time::Duration::from_millis(15);
                     for i in 1..=steps {
+                        // Abort if a newer slide command invalidated us
+                        if let Some(gen) = captured_gen {
+                            if let Some(state) = app.try_state::<Arc<PopupSlideGen>>() {
+                                if state.gen.load(Ordering::SeqCst) != gen { return; }
+                            }
+                        }
                         let progress = i as f64 / steps as f64;
                         let eased = 1.0 - (1.0 - progress).powi(3);
                         let current_x = from_x + total_distance * eased;
@@ -1332,6 +1430,14 @@ async fn slide_left_and_destroy_popup(app: tauri::AppHandle, label: String) -> R
             Ok(pos) => pos.x as f64,
             Err(_) => -20.0,
         };
+
+        // Bump slide gen to kill any existing slide threads (slide-back)
+        if let Some(gen) = app.try_state::<Arc<PopupSlideGen>>() {
+            gen.gen.fetch_add(1, Ordering::SeqCst);
+        }
+        let captured_gen = app.try_state::<Arc<PopupSlideGen>>()
+            .map(|g| g.gen.load(Ordering::SeqCst));
+
         // Animate left in background thread
         let app_clone = app.clone();
         std::thread::spawn(move || {
@@ -1340,6 +1446,18 @@ async fn slide_left_and_destroy_popup(app: tauri::AppHandle, label: String) -> R
             let total_distance = target_x - from_x;
             let step_delay = std::time::Duration::from_millis(15);
             for i in 1..=steps {
+                // Abort if a newer slide command invalidated us
+                if let Some(gen) = captured_gen {
+                    if let Some(state) = app_clone.try_state::<Arc<PopupSlideGen>>() {
+                        if state.gen.load(Ordering::SeqCst) != gen {
+                            // Still need to resume polling
+                            if let Some(state) = app_clone.try_state::<Arc<PopupExpanded>>() {
+                                state.slide_in_progress.store(false, Ordering::SeqCst);
+                            }
+                            return;
+                        }
+                    }
+                }
                 let progress = i as f64 / steps as f64;
                 let eased = 1.0 - (1.0 - progress).powi(3);
                 let current_x = from_x + total_distance * eased;
@@ -1477,6 +1595,9 @@ pub fn run() {
             app.manage(Arc::new(PopupHeights {
                 map: Mutex::new(HashMap::new()),
             }));
+
+            // Track popup slide animation generation (cancels stale slide threads)
+            app.manage(Arc::new(PopupSlideGen { gen: AtomicU32::new(0) }));
 
             // --- Tray icon & menu ---
             let menu = Menu::with_items(
