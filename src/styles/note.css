@@ -12,7 +12,7 @@
 
 .note-inner {
   flex: 1;
-  overflow: visible;
+  overflow: hidden;
   display: flex;
   flex-direction: column;
   position: relative;
@@ -213,7 +213,7 @@
   flex: 1;
   text-align: left;
   font-family: "Indie Flower", cursive;
-  font-size: 20px;
+  font-size: 16px;
   font-weight: 600;
   color: rgba(0, 0, 0, 0.6);
   outline: none;
@@ -322,7 +322,7 @@
 /* Individual todo item */
 .todo-item {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   padding: 4px 14px;
   position: relative;
@@ -368,12 +368,11 @@
 .todo-text {
   flex: 1;
   font-family: "Indie Flower", cursive;
-  font-size: 20px;
+  font-size: 14px;
   color: rgba(0, 0, 0, 0.6);
   line-height: 1.5;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  word-break: break-word;
   min-width: 0;
 }
 
@@ -425,7 +424,7 @@
   border: none;
   background: transparent;
   font-family: "Indie Flower", cursive;
-  font-size: 20px;
+  font-size: 14px;
   color: rgba(0, 0, 0, 0.6);
   outline: none;
   padding: 0;
