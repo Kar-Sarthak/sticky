@@ -1239,6 +1239,18 @@ fn poll_popup_hover(app: Arc<tauri::AppHandle>, popup_labels: Vec<String>) {
     ));
 }
 
+/// Tauri command: lock a popup for destruction so the polling thread yields immediately.
+/// Call this BEFORE the CSS fade delay so the polling thread doesn't race into a slide-back.
+#[tauri::command]
+async fn lock_popup_for_destruction(app: tauri::AppHandle, label: String) -> Result<(), String> {
+    if app.get_webview_window(&label).is_some() {
+        if let Some(state) = app.try_state::<Arc<PopupExpanded>>() {
+            state.slide_in_progress.store(true, Ordering::SeqCst);
+        }
+    }
+    Ok(())
+}
+
 /// Tauri command: slide a single todo popup window left off-screen and destroy it.
 #[tauri::command]
 async fn slide_left_and_destroy_popup(app: tauri::AppHandle, label: String) -> Result<(), String> {
@@ -1247,10 +1259,6 @@ async fn slide_left_and_destroy_popup(app: tauri::AppHandle, label: String) -> R
             Ok(pos) => pos.x as f64,
             Err(_) => -20.0,
         };
-        // Signal polling thread to pause while this destroys
-        if let Some(state) = app.try_state::<Arc<PopupExpanded>>() {
-            state.slide_in_progress.store(true, Ordering::SeqCst);
-        }
         // Animate left in background thread
         let app_clone = app.clone();
         std::thread::spawn(move || {
@@ -1451,6 +1459,7 @@ pub fn run() {
             delete_todo,
             delete_note_todos,
             get_note_todos,
+            lock_popup_for_destruction,
             slide_left_and_destroy_popup
         ])
         .run(tauri::generate_context!())

@@ -20,12 +20,16 @@ export default function TodoPopupWindow() {
   const handleToggle = async () => {
     if (!todoId || done) return;
     try {
+      const win = getCurrentWindow();
       await invoke("toggle_todo", { todoId });
       setDone(true);
 
-      // Wait for strikethrough + fade animation to be visible
+      // Lock immediately so the polling thread yields during the fade delay.
+      // Without this, the 500ms gap creates a race: cursor leaves → polling
+      // thread triggers slide-back → fights with the destroy thread.
+      await invoke("lock_popup_for_destruction", { label: win.label });
+
       setTimeout(async () => {
-        const win = getCurrentWindow();
         await invoke("slide_left_and_destroy_popup", { label: win.label });
       }, 500);
     } catch (err) {
