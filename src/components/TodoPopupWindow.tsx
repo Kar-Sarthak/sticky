@@ -1,15 +1,37 @@
 import { useState, useEffect, useRef } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
 import "../styles/todo-popup.css";
 
 export default function TodoPopupWindow() {
   const [task, setTask] = useState("");
+  const [todoId, setTodoId] = useState("");
+  const [done, setDone] = useState(false);
   const animLockRef = useRef(false);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.hash.split("?")[1] || "");
     const taskParam = params.get("task") || "";
+    const idParam = params.get("id") || "";
     setTask(decodeURIComponent(taskParam));
+    setTodoId(idParam);
   }, []);
+
+  const handleToggle = async () => {
+    if (!todoId || done) return;
+    try {
+      await invoke("toggle_todo", { todoId });
+      setDone(true);
+
+      // Wait for strikethrough + fade animation to be visible
+      setTimeout(async () => {
+        const win = getCurrentWindow();
+        await invoke("slide_left_and_destroy_popup", { label: win.label });
+      }, 500);
+    } catch (err) {
+      console.error("Failed to toggle todo:", err);
+    }
+  };
 
   const handleMouseEnter = () => {
     if (animLockRef.current) return;
@@ -27,8 +49,8 @@ export default function TodoPopupWindow() {
 
   return (
     <div className="todo-popup-window" onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave}>
-      <div className="todo-popup-item">
-        <input type="checkbox" disabled />
+      <div className={`todo-popup-item${done ? " done" : ""}`}>
+        <input type="checkbox" checked={done} onChange={handleToggle} />
         <span className="todo-popup-text">{task}</span>
       </div>
     </div>

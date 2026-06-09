@@ -6,7 +6,7 @@
   overflow: hidden;
   border-radius: 4px;
   background: #FFE066;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.06);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 0.5px 1px rgba(0, 0, 0, 0.03);
   padding: 0;
   display: flex;
   flex-direction: column;
@@ -47,6 +47,27 @@
   flex-shrink: 0;
   position: relative;
   background-color: transparent;
+  cursor: pointer;
+  transition: border-color 0.1s, background-color 0.1s;
+}
+
+.todo-popup-item input[type="checkbox"]:hover {
+  border-color: rgba(0, 0, 0, 0.4);
+}
+
+.todo-popup-item input[type="checkbox"]:checked {
+  border-color: rgba(0, 0, 0, 0.4);
+  background-color: rgba(0, 0, 0, 0.15);
+}
+
+.todo-popup-item input[type="checkbox"]:checked::after {
+  content: "✓";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 11px;
+  color: rgba(0, 0, 0, 0.6);
 }
 
 .todo-popup-text {
@@ -58,4 +79,17 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  transition: text-decoration 0.3s ease, color 0.3s ease;
+}
+
+/* ---------- Done / Fading ---------- */
+
+.todo-popup-window.fading {
+  opacity: 0.5;
+  transition: opacity 0.3s ease;
+}
+
+.todo-popup-item.done .todo-popup-text {
+  text-decoration: line-through;
+  color: rgba(0, 0, 0, 0.3);
 }

@@ -963,7 +963,7 @@ fn spawn_todo_popup_windows(app: &tauri::AppHandle, todos: &[TodoItem]) {
     // Start bounce animation for all popup windows (after 200ms delay)
     let app = app.clone();
     std::thread::spawn(move || {
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_secs(3));
         start_popup_bounce(&app);
     });
 }
@@ -1507,6 +1507,40 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
     ));
 }
 
+/// Tauri command: slide a single todo popup window left off-screen and destroy it.
+#[tauri::command]
+async fn slide_left_and_destroy_popup(app: tauri::AppHandle, label: String) -> Result<(), String> {
+    if let Some(win) = app.get_webview_window(&label) {
+        let from_x = match win.outer_position() {
+            Ok(pos) => pos.x as f64,
+            Err(_) => -20.0,
+        };
+        // Animate left in background thread
+        std::thread::spawn(move || {
+            let steps = 20;
+            let target_x = -400.0;
+            let total_distance = target_x - from_x;
+            let step_delay = std::time::Duration::from_millis(15);
+            for i in 1..=steps {
+                let progress = i as f64 / steps as f64;
+                let eased = 1.0 - (1.0 - progress).powi(3);
+                let current_x = from_x + total_distance * eased;
+                if let Some(win) = app.get_webview_window(&label) {
+                    if let Ok(pos) = win.outer_position() {
+                        win.set_position(tauri::PhysicalPosition::new(current_x as i32, pos.y as i32)).ok();
+                    }
+                }
+                std::thread::sleep(step_delay);
+            }
+            // Destroy after animation
+            if let Some(win) = app.get_webview_window(&label) {
+                win.destroy().ok();
+            }
+        });
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1686,7 +1720,8 @@ pub fn run() {
             delete_todo,
             delete_note_todos,
             get_note_todos,
-            check_context_todos_and_slide
+            check_context_todos_and_slide,
+            slide_left_and_destroy_popup
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
