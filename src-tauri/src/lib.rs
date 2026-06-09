@@ -3,7 +3,7 @@ mod models;
 use models::{Note, TodoItem};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::Emitter;
 use tauri::Manager;
@@ -32,10 +32,19 @@ struct PopupBounceActive {
     active: AtomicBool,
 }
 
+/// Generation counter for popup bounce. Incremented on /slide-left.
+/// Stale 3-second delay threads check this before starting bounce —
+/// if the generation changed, they cancel themselves.
+struct PopupBounceGen {
+    gen: AtomicU32,
+}
+
 /// Tracks whether popup windows are currently expanded (hovered).
 /// Polling thread checks cursor position and slides back if mouse left.
 struct PopupExpanded {
     expanded: AtomicBool,
+    polling_active: AtomicBool,
+    slide_in_progress: AtomicBool,
 }
 
 /// Toggle visibility of all note windows.
@@ -779,11 +788,26 @@ fn spawn_todo_popup_windows(app: &tauri::AppHandle, todos: &[TodoItem]) {
         }
     }
 
-    // Start bounce animation for all popup windows (after 3s delay, matching reminder)
+    // Start bounce animation for all popup windows (after 3s delay, matching reminder).
+    // Capture current generation so a stale delay thread from a previous context
+    // doesn't bounce windows for the wrong context.
+    if let Some(gen) = app.try_state::<Arc<PopupBounceGen>>() {
+        gen.gen.fetch_add(1, Ordering::SeqCst);
+    }
+    let captured_gen = app.try_state::<Arc<PopupBounceGen>>()
+        .map(|g| g.gen.load(Ordering::SeqCst));
     let app = app.clone();
     std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(3));
-        start_popup_bounce(&app);
+        // Check if a context change happened during the 3s delay
+        if let Some(current_gen) = captured_gen {
+            if let Some(gen_state) = app.try_state::<Arc<PopupBounceGen>>() {
+                if gen_state.gen.load(Ordering::SeqCst) == current_gen {
+                    start_popup_bounce(&app);
+                }
+                // Generation mismatch → stale thread, cancel silently
+            }
+        }
     });
 }
 
@@ -878,8 +902,17 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
 
     // Handle /slide-left: animate all todo popup windows left off-screen, then destroy them
     if request.method() == &Method::Post && request.url() == "/slide-left" {
-        // Stop any running popup bounce
+        // Bounce generation — invalidates any stale 3s delay threads from previous context
+        if let Some(gen) = app.try_state::<Arc<PopupBounceGen>>() {
+            gen.gen.fetch_add(1, Ordering::SeqCst);
+        }
+        // Stop any running popup bounce and kill polling thread
         stop_popup_bounce(&app);
+        if let Some(state) = app.try_state::<Arc<PopupExpanded>>() {
+            state.expanded.store(false, Ordering::SeqCst);
+            state.polling_active.store(false, Ordering::SeqCst);
+            state.slide_in_progress.store(false, Ordering::SeqCst);
+        }
 
         // Collect popup labels first so we don't hold the lock during animation
         let popup_labels: Vec<String> = app
@@ -906,9 +939,11 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
 
     // Handle /slide-left-popup: slide all popup windows back to x=-380 (context change / force hide)
     if request.method() == &Method::Post && request.url() == "/slide-left-popup" {
-        // Clear expanded flag and stop bounce to kill any running polling/bounce threads
+        // Clear expanded flag, reset polling guard, and stop bounce to kill any running polling/bounce threads
         if let Some(state) = app.try_state::<Arc<PopupExpanded>>() {
             state.expanded.store(false, Ordering::SeqCst);
+            state.polling_active.store(false, Ordering::SeqCst);
+            state.slide_in_progress.store(false, Ordering::SeqCst);
         }
         stop_popup_bounce(&app);
 
@@ -957,11 +992,133 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
         return;
     }
 
+/// Polling thread for popup hover: checks cursor position every 1s,
+/// slides windows back to x=-380 if cursor leaves (with 300ms grace period).
+fn poll_popup_hover(app: Arc<tauri::AppHandle>, popup_labels: Vec<String>) {
+    // Wait for slide-right animation to complete before polling
+    std::thread::sleep(std::time::Duration::from_millis(400));
+
+    loop {
+        // Check if still expanded
+        let still_expanded = app.try_state::<Arc<PopupExpanded>>()
+            .map(|s| s.expanded.load(Ordering::SeqCst))
+            .unwrap_or(false);
+        if !still_expanded {
+            // Another handler cleared us — reset flag so next hover can spawn
+            if let Some(state) = app.try_state::<Arc<PopupExpanded>>() {
+                state.polling_active.store(false, Ordering::SeqCst);
+            }
+            return;
+        }
+
+        // Pause polling while a popup is being destroyed (checkbox click)
+        let slide_busy = app.try_state::<Arc<PopupExpanded>>()
+            .map(|s| s.slide_in_progress.load(Ordering::SeqCst))
+            .unwrap_or(false);
+        if slide_busy {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            continue;
+        }
+
+        // Get cursor position using Win32 API
+        let cursor_in_popup = {
+            #[repr(C)]
+            struct POINT {
+                x: i32,
+                y: i32,
+            }
+            extern "system" {
+                fn GetCursorPos(lpPoint: *mut POINT) -> i32;
+            }
+            let mut pt = POINT { x: 0, y: 0 };
+            let ok = unsafe { GetCursorPos(&mut pt) };
+            if ok == 0 {
+                continue;
+            }
+            // Compute combined bounding box across all popups (includes gaps)
+            let mut min_x = i32::MAX;
+            let mut max_x = i32::MIN;
+            let mut min_y = i32::MAX;
+            let mut max_y = i32::MIN;
+            for label in &popup_labels {
+                if let Some(win) = app.get_webview_window(label) {
+                    if let (Ok(pos), Ok(size)) = (win.outer_position(), win.inner_size()) {
+                        let wx = pos.x as i32;
+                        let wy = pos.y as i32;
+                        let ww = size.width as i32;
+                        let wh = size.height as i32;
+                        if wx < min_x { min_x = wx; }
+                        if wx + ww > max_x { max_x = wx + ww; }
+                        if wy < min_y { min_y = wy; }
+                        if wy + wh > max_y { max_y = wy + wh; }
+                    }
+                }
+            }
+            pt.x >= min_x && pt.x <= max_x && pt.y >= min_y && pt.y <= max_y
+        };
+
+        if !cursor_in_popup {
+            // Mouse is outside — start 300ms grace period before sliding back.
+            // If user re-enters during this window, /slide-right will set
+            // expanded back to true, cancelling the slide.
+            if let Some(state) = app.try_state::<Arc<PopupExpanded>>() {
+                state.expanded.store(false, Ordering::SeqCst);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+
+            // Check if mouse re-entered during grace period
+            let still_expanded = app.try_state::<Arc<PopupExpanded>>()
+                .map(|s| s.expanded.load(Ordering::SeqCst))
+                .unwrap_or(false);
+            if still_expanded {
+                continue; // Mouse came back, keep polling, don't slide
+            }
+
+            // Slide all popups back to -380
+            for label in &popup_labels {
+                if let Some(win) = app.get_webview_window(label) {
+                    let from_x = match win.outer_position() {
+                        Ok(pos) => pos.x as f64,
+                        Err(_) => -20.0,
+                    };
+                    let label = label.clone();
+                    let app = app.clone();
+                    std::thread::spawn(move || {
+                        let steps = 20;
+                        let total_distance = -380.0 - from_x;
+                        let step_delay = std::time::Duration::from_millis(15);
+                        for i in 1..=steps {
+                            let progress = i as f64 / steps as f64;
+                            let eased = 1.0 - (1.0 - progress).powi(3);
+                            let current_x = from_x + total_distance * eased;
+                            if let Some(win) = app.get_webview_window(&label) {
+                                if let Ok(pos) = win.outer_position() {
+                                    win.set_position(tauri::PhysicalPosition::new(current_x as i32, pos.y as i32)).ok();
+                                }
+                            }
+                            std::thread::sleep(step_delay);
+                        }
+                    });
+                }
+            }
+            break;
+        }
+
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+    }
+
+    // Polling thread finished — reset flag so next hover can spawn a new one
+    if let Some(state) = app.try_state::<Arc<PopupExpanded>>() {
+        state.polling_active.store(false, Ordering::SeqCst);
+    }
+}
+
     // Handle /slide-right: slide all popup windows right to x=-20 (hover reveal)
     if request.method() == &Method::Post && request.url() == "/slide-right" {
-        // Set expanded flag
+        // Set expanded flag, clear any in-progress destroy slide
         if let Some(state) = app.try_state::<Arc<PopupExpanded>>() {
             state.expanded.store(true, Ordering::SeqCst);
+            state.slide_in_progress.store(false, Ordering::SeqCst);
         }
 
         // Stop popup bounce
@@ -1003,96 +1160,18 @@ fn handle_reminder_request(app: &Arc<tauri::AppHandle>, mut request: tiny_http::
         }
 
         // Spawn polling thread: every 1s check if cursor is over any popup
-        let popup_labels_clone = popup_labels.clone();
-        let app_clone = app.clone();
-        std::thread::spawn(move || {
-            // Wait for slide animation to complete before polling
-            std::thread::sleep(std::time::Duration::from_millis(400));
-
-            loop {
-                // Check if still expanded
-                let still_expanded = app_clone.try_state::<Arc<PopupExpanded>>()
-                    .map(|s| s.expanded.load(Ordering::SeqCst))
-                    .unwrap_or(false);
-                if !still_expanded {
-                    return;
-                }
-
-                // Get cursor position using Win32 API
-                let cursor_in_popup = {
-                    #[repr(C)]
-                    struct POINT {
-                        x: i32,
-                        y: i32,
-                    }
-                    extern "system" {
-                        fn GetCursorPos(lpPoint: *mut POINT) -> i32;
-                    }
-                    let mut pt = POINT { x: 0, y: 0 };
-                    let ok = unsafe { GetCursorPos(&mut pt) };
-                    if ok == 0 {
-                        continue;
-                    }
-                    // Compute combined bounding box across all popups (includes gaps)
-                    let mut min_x = i32::MAX;
-                    let mut max_x = i32::MIN;
-                    let mut min_y = i32::MAX;
-                    let mut max_y = i32::MIN;
-                    for label in &popup_labels_clone {
-                        if let Some(win) = app_clone.get_webview_window(label) {
-                            if let (Ok(pos), Ok(size)) = (win.outer_position(), win.inner_size()) {
-                                let wx = pos.x as i32;
-                                let wy = pos.y as i32;
-                                let ww = size.width as i32;
-                                let wh = size.height as i32;
-                                if wx < min_x { min_x = wx; }
-                                if wx + ww > max_x { max_x = wx + ww; }
-                                if wy < min_y { min_y = wy; }
-                                if wy + wh > max_y { max_y = wy + wh; }
-                            }
-                        }
-                    }
-                    pt.x >= min_x && pt.x <= max_x && pt.y >= min_y && pt.y <= max_y
-                };
-
-                if !cursor_in_popup {
-                    // Mouse is outside, slide back
-                    if let Some(state) = app_clone.try_state::<Arc<PopupExpanded>>() {
-                        state.expanded.store(false, Ordering::SeqCst);
-                    }
-                    // Slide all popups back to -380
-                    for label in &popup_labels_clone {
-                        if let Some(win) = app_clone.get_webview_window(label) {
-                            let from_x = match win.outer_position() {
-                                Ok(pos) => pos.x as f64,
-                                Err(_) => -20.0,
-                            };
-                            let label = label.clone();
-                            let app = app_clone.clone();
-                            std::thread::spawn(move || {
-                                let steps = 20;
-                                let total_distance = -380.0 - from_x;
-                                let step_delay = std::time::Duration::from_millis(15);
-                                for i in 1..=steps {
-                                    let progress = i as f64 / steps as f64;
-                                    let eased = 1.0 - (1.0 - progress).powi(3);
-                                    let current_x = from_x + total_distance * eased;
-                                    if let Some(win) = app.get_webview_window(&label) {
-                                        if let Ok(pos) = win.outer_position() {
-                                            win.set_position(tauri::PhysicalPosition::new(current_x as i32, pos.y as i32)).ok();
-                                        }
-                                    }
-                                    std::thread::sleep(step_delay);
-                                }
-                            });
-                        }
-                    }
-                    break; // Done, polling thread ends
-                }
-
-                std::thread::sleep(std::time::Duration::from_millis(1000));
+        // Guard: only one polling thread at a time to prevent races
+        if let Some(state) = app.try_state::<Arc<PopupExpanded>>() {
+            if state.polling_active.swap(true, Ordering::SeqCst) {
+                // Another polling thread already running — skip spawn
+            } else {
+                let popup_labels_clone = popup_labels.clone();
+                let app_clone = app.clone();
+                std::thread::spawn(move || {
+                    poll_popup_hover(app_clone, popup_labels_clone);
+                });
             }
-        });
+        }
 
         let resp_body = Cursor::new(b"{\"status\":\"sliding-right\"}");
         let _ = request.respond(Response::new(
@@ -1168,7 +1247,12 @@ async fn slide_left_and_destroy_popup(app: tauri::AppHandle, label: String) -> R
             Ok(pos) => pos.x as f64,
             Err(_) => -20.0,
         };
+        // Signal polling thread to pause while this destroys
+        if let Some(state) = app.try_state::<Arc<PopupExpanded>>() {
+            state.slide_in_progress.store(true, Ordering::SeqCst);
+        }
         // Animate left in background thread
+        let app_clone = app.clone();
         std::thread::spawn(move || {
             let steps = 20;
             let target_x = -400.0;
@@ -1188,6 +1272,10 @@ async fn slide_left_and_destroy_popup(app: tauri::AppHandle, label: String) -> R
             // Destroy after animation
             if let Some(win) = app.get_webview_window(&label) {
                 win.destroy().ok();
+            }
+            // Resume polling
+            if let Some(state) = app_clone.try_state::<Arc<PopupExpanded>>() {
+                state.slide_in_progress.store(false, Ordering::SeqCst);
             }
         });
     }
@@ -1294,9 +1382,14 @@ pub fn run() {
             // Track popup bounce active flag
             app.manage(Arc::new(PopupBounceActive { active: AtomicBool::new(false) }));
 
+            // Track popup bounce generation (cancels stale delayed bounce threads)
+            app.manage(Arc::new(PopupBounceGen { gen: AtomicU32::new(0) }));
+
             // Track whether popup windows are expanded (for hover polling)
             app.manage(Arc::new(PopupExpanded {
                 expanded: AtomicBool::new(false),
+                polling_active: AtomicBool::new(false),
+                slide_in_progress: AtomicBool::new(false),
             }));
 
             // --- Tray icon & menu ---
