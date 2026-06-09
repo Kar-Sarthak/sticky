@@ -76,9 +76,8 @@
   color: rgba(0, 0, 0, 0.6);
   line-height: 1.5;
   flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  word-break: break-word;
   transition: text-decoration 0.3s ease, color 0.3s ease;
 }
 

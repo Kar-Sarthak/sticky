@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import { invoke } from "@tauri-apps/api/core";
 import "../styles/todo-popup.css";
 
@@ -8,6 +8,7 @@ export default function TodoPopupWindow() {
   const [todoId, setTodoId] = useState("");
   const [done, setDone] = useState(false);
   const animLockRef = useRef(false);
+  const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.hash.split("?")[1] || "");
@@ -16,6 +17,34 @@ export default function TodoPopupWindow() {
     setTask(decodeURIComponent(taskParam));
     setTodoId(idParam);
   }, []);
+
+  // Measure wrapped content and resize the window to fit
+  useEffect(() => {
+    if (!task) return;
+    const el = containerRef.current;
+    if (!el) return;
+
+    // Wait for the font to load so the text wraps correctly before measuring
+    document.fonts.ready.then(() => {
+      const textEl = el.querySelector(".todo-popup-text") as HTMLElement | null;
+      const textScroll = textEl?.scrollHeight;
+
+      // Compute total height from text content + item padding (4px top + 4px bottom) + border
+      const itemHeight = (textScroll || 0) + 9;
+      const win = getCurrentWindow();
+      win.setSize(new LogicalSize(300, itemHeight))
+        .then(async () => {
+          // Read actual outer size after resize
+          const outer = await win.outerSize();
+          invoke("popup_debug", {
+            msg: `label=${win.label} itemHeight=${itemHeight} outerHeight=${outer.height} textScroll=${textScroll}`,
+          }).catch(() => {});
+          // Register height so Rust can reposition all popups with correct gaps
+          invoke("register_popup_height", { label: win.label, height: outer.height }).catch(() => {});
+        })
+        .catch((e) => invoke("popup_debug", { msg: `label=${win.label} setSize FAILED → 300x${itemHeight} err=${e}` }));
+    });
+  }, [task]);
 
   const handleToggle = async () => {
     if (!todoId || done) return;
@@ -52,7 +81,7 @@ export default function TodoPopupWindow() {
   };
 
   return (
-    <div className="todo-popup-window" onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave}>
+    <div className="todo-popup-window" ref={containerRef} onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave}>
       <div className={`todo-popup-item${done ? " done" : ""}`}>
         <input type="checkbox" checked={done} onChange={handleToggle} />
         <span className="todo-popup-text">{task}</span>

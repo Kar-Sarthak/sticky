@@ -12,6 +12,7 @@
     "core:window:allow-destroy",
     "core:window:allow-set-focus",
     "core:window:allow-is-visible",
+    "core:window:allow-set-size",
     "core:webview:allow-create-webview-window",
     "core:tray:default",
     "core:menu:default",

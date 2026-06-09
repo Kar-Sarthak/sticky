@@ -47,6 +47,12 @@ struct PopupExpanded {
     slide_in_progress: AtomicBool,
 }
 
+/// Maps popup label → measured height. Used to compute dynamic Y positions
+/// with correct gaps when each popup reports its size after font loading.
+struct PopupHeights {
+    map: Mutex<HashMap<String, f64>>,
+}
+
 /// Toggle visibility of all note windows.
 /// If notes_visible == true → hide all notes, set notes_visible = false.
 /// If notes_visible == false → show all notes, set notes_visible = true.
@@ -1239,6 +1245,73 @@ fn poll_popup_hover(app: Arc<tauri::AppHandle>, popup_labels: Vec<String>) {
     ));
 }
 
+/// Debug: print a message from the frontend to the terminal.
+#[tauri::command]
+async fn popup_debug(msg: String) {
+    println!("[popup-debug] {}", msg);
+}
+
+/// Register a popup's measured height and reposition all popups with correct gaps.
+/// Called by each popup after it resizes itself. The last popup to report does the
+/// final layout — no locking needed, each reposition is atomic and idempotent.
+#[tauri::command]
+async fn register_popup_height(app: tauri::AppHandle, label: String, height: f64) -> Result<(), String> {
+    // Store this popup's height
+    if let Some(state) = app.try_state::<Arc<PopupHeights>>() {
+        state.map.lock().expect("poisoned").insert(label, height);
+    }
+
+    // Collect all popup labels and their current positions
+    let mut popups: Vec<(String, f64)> = app
+        .webview_windows()
+        .iter()
+        .filter(|(label, _)| label.starts_with("todo-popup-"))
+        .filter_map(|(label, _)| {
+            app.get_webview_window(label)
+                .and_then(|w| w.outer_position().ok().map(|p| (label.to_string(), p.y as f64)))
+        })
+        .collect();
+
+    // Sort by current Y position to preserve spawn order
+    popups.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Read registered heights, fall back to current window size for unregistered popups
+    let height_map = app.try_state::<Arc<PopupHeights>>()
+        .map(|s| s.map.lock().expect("poisoned").clone())
+        .unwrap_or_default();
+
+    // Reposition with cumulative Y offsets
+    let mut y = 50.0;
+    const GAP: f64 = 10.0;
+    let mut debug_parts = Vec::new();
+    for (popup_label, _current_y) in &popups {
+        let popup_height = height_map.get(popup_label)
+            .copied()
+            .unwrap_or_else(|| {
+                // Fallback: read actual window height
+                app.get_webview_window(popup_label)
+                    .and_then(|w| w.outer_size().ok().map(|s| s.height as f64))
+                    .unwrap_or(31.0)
+            });
+
+        if let Some(win) = app.get_webview_window(popup_label) {
+            if let Ok(pos) = win.outer_position() {
+                win.set_position(tauri::PhysicalPosition::new(pos.x as i32, y as i32)).ok();
+            }
+        }
+
+        // Debug: label + registered height + computed Y + bottom edge
+        let registered = height_map.get(popup_label).map(|h| *h as i32).unwrap_or(-1);
+        debug_parts.push(format!("{}(reg={}→y={},bottom={})", popup_label, registered, y as i32, (y + popup_height) as i32));
+
+        y += popup_height + GAP;
+    }
+
+    println!("[popup-layout] {}", debug_parts.join(" | "));
+
+    Ok(())
+}
+
 /// Tauri command: lock a popup for destruction so the polling thread yields immediately.
 /// Call this BEFORE the CSS fade delay so the polling thread doesn't race into a slide-back.
 #[tauri::command]
@@ -1400,6 +1473,11 @@ pub fn run() {
                 slide_in_progress: AtomicBool::new(false),
             }));
 
+            // Track measured popup heights for dynamic Y positioning
+            app.manage(Arc::new(PopupHeights {
+                map: Mutex::new(HashMap::new()),
+            }));
+
             // --- Tray icon & menu ---
             let menu = Menu::with_items(
                 app,
@@ -1459,8 +1537,10 @@ pub fn run() {
             delete_todo,
             delete_note_todos,
             get_note_todos,
+            register_popup_height,
             lock_popup_for_destruction,
-            slide_left_and_destroy_popup
+            slide_left_and_destroy_popup,
+            popup_debug
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
