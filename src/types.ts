@@ -13,4 +13,5 @@ export interface TodoItem {
   id: string;
   task: string;
   status: "undone" | "done";
+  seen: boolean;
 }

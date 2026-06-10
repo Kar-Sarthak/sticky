@@ -5,17 +5,17 @@ import "../styles/todo-popup.css";
 
 export default function TodoPopupWindow() {
   const [task, setTask] = useState("");
-  const [todoId, setTodoId] = useState("");
   const [done, setDone] = useState(false);
+  const [unseen, setUnseen] = useState(false);
   const animLockRef = useRef(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.hash.split("?")[1] || "");
     const taskParam = params.get("task") || "";
-    const idParam = params.get("id") || "";
+    const seenParam = params.get("seen") || "0";
     setTask(decodeURIComponent(taskParam));
-    setTodoId(idParam);
+    setUnseen(seenParam === "0");
   }, []);
 
   // Measure wrapped content and resize the window to fit
@@ -47,7 +47,9 @@ export default function TodoPopupWindow() {
   }, [task]);
 
   const handleToggle = async () => {
-    if (!todoId || done) return;
+    // Extract todo ID from window label (now "todo-popup-{todo_id}")
+    const todoId = getCurrentWindow().label.replace("todo-popup-", "");
+    if (done) return;
     try {
       const win = getCurrentWindow();
       await invoke("toggle_todo", { todoId });
@@ -81,7 +83,7 @@ export default function TodoPopupWindow() {
   };
 
   return (
-    <div className="todo-popup-window" ref={containerRef} onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave}>
+    <div className={`todo-popup-window${unseen ? " unseen" : ""}`} ref={containerRef} onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave}>
       <div className={`todo-popup-item${done ? " done" : ""}`}>
         <input type="checkbox" checked={done} onChange={handleToggle} />
         <span className="todo-popup-text">{task}</span>

@@ -333,6 +333,7 @@ async fn add_todo(app: tauri::AppHandle, note_id: String, task: String) -> Resul
         id: id.clone(),
         task,
         status: "undone".to_string(),
+        seen: false,
     };
     todos.push(todo.clone());
     save_all_todos(&app, &todos)?;
@@ -368,8 +369,14 @@ async fn toggle_todo(app: tauri::AppHandle, todo_id: String) -> Result<(), Strin
 
     let mut new_status = None;
     if let Some(todo) = todos.iter_mut().find(|t| t.id == todo_id) {
-        todo.status = if todo.status == "done" { "undone".to_string() } else { "done".to_string() };
-        new_status = Some(todo.status.clone());
+        if todo.status == "done" {
+            todo.status = "undone".to_string();
+            todo.seen = false;  // Reset seen when a todo is un-done
+            new_status = Some(todo.status.clone());
+        } else {
+            todo.status = "done".to_string();
+            new_status = Some(todo.status.clone());
+        }
     }
     save_all_todos(&app, &todos)?;
 
@@ -779,13 +786,15 @@ fn spawn_todo_popup_windows(app: &tauri::AppHandle, todos: &[TodoItem]) {
     let x = -500i32;
 
     for (i, todo) in todos.iter().enumerate() {
-        let popup_id = Uuid::new_v4();
-        let label = format!("todo-popup-{}", popup_id);
+        // Label encodes the todo ID so Rust can extract it without reading the URL
+        let label = format!("todo-popup-{}", todo.id);
         let y = (TODO_POPUP_START_Y + (i as f64 * TODO_POPUP_SPACING)) as i32;
 
         // Encode task text for URL (percent-encoded)
         let encoded_task = encode_uri_component(&todo.task);
-        let url = format!("index.html#todo-popup?id={}&task={}", todo.id, encoded_task);
+        // Pass seen status so frontend can apply pink background for unseen todos
+        let seen_param = if todo.seen { "1" } else { "0" };
+        let url = format!("index.html#todo-popup?seen={}&task={}", seen_param, encoded_task);
 
         tauri::WebviewWindowBuilder::new(
             app,
@@ -1104,6 +1113,15 @@ fn poll_popup_hover(app: Arc<tauri::AppHandle>, popup_labels: Vec<String>) {
             }
             std::thread::sleep(std::time::Duration::from_millis(300));
 
+            // If a checkbox click or context change happened during the grace period,
+            // abort the slide-back to let the destruction/context change finish.
+            let slide_busy = app.try_state::<Arc<PopupExpanded>>()
+                .map(|s| s.slide_in_progress.load(Ordering::SeqCst))
+                .unwrap_or(false);
+            if slide_busy {
+                continue;
+            }
+
             // Failsafe: re-check actual cursor position after grace period.
             // Even if the frontend swallowed the mouseenter event (animLockRef debounce),
             // the physical cursor might be back over the popups — don't dismiss in that case.
@@ -1260,6 +1278,27 @@ fn poll_popup_hover(app: Arc<tauri::AppHandle>, popup_labels: Vec<String>) {
                         std::thread::sleep(step_delay);
                     }
                 });
+            }
+        }
+
+        // Mark all visible popup todos as seen
+        let todo_ids_to_mark: Vec<String> = popup_labels
+            .iter()
+            .filter_map(|l| l.strip_prefix("todo-popup-").map(|s| s.to_string()))
+            .collect();
+
+        if !todo_ids_to_mark.is_empty() {
+            if let Ok(mut todos) = get_all_todos(&app) {
+                let mut changed = false;
+                for todo in &mut todos {
+                    if todo_ids_to_mark.contains(&todo.id) && !todo.seen {
+                        todo.seen = true;
+                        changed = true;
+                    }
+                }
+                if changed {
+                    let _ = save_all_todos(&app, &todos);
+                }
             }
         }
 

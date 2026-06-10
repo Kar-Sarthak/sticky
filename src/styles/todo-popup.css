@@ -92,3 +92,9 @@
   text-decoration: line-through;
   color: rgba(0, 0, 0, 0.3);
 }
+
+/* ---------- Unseen (pink) ---------- */
+
+.todo-popup-window.unseen {
+  background: #FFB3C1;
+}

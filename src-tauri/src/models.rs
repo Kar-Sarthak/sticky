@@ -6,6 +6,8 @@ pub struct TodoItem {
     pub id: String,
     pub task: String,
     pub status: String, // "undone" | "done"
+    #[serde(default)]
+    pub seen: bool,
 }
 
 /// A sticky note. Instead of raw content, stores an ordered list of todo IDs.
