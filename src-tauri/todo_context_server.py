@@ -184,6 +184,14 @@ def detect_current_contexts(title, process, hwnd):
                 if pattern in url_lower:
                     contexts.add(context_name)
                     break
+    # ─── NEW: Browser fallback if no URL context was matched ───
+    if url == "":
+        if "firefox" in process:
+            contexts.add("firefox")
+        elif "chrome" in process:
+            contexts.add("chrome")
+        elif "msedge" in process or "edge" in process:
+            contexts.add("edge")
 
     # Process-based contexts
     for proc_key, ctx_name in CONTEXT_PROCESS_MAP.items():

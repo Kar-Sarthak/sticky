@@ -810,6 +810,7 @@ fn spawn_todo_popup_windows(app: &tauri::AppHandle, todos: &[TodoItem]) {
         .always_on_top(true)
         .skip_taskbar(true)
         .visible(false)
+        .focused(false) 
         .build()
         .ok();
 
