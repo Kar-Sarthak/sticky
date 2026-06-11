@@ -14,6 +14,7 @@ Endpoints:
 import json
 import sys
 import os
+import re
 import threading
 import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -163,52 +164,28 @@ CONTEXT_PROCESS_MAP = {
 # Process names that belong to our own app — ignore these for context detection
 OWN_APP_PROCESSES = {"sticky-notes.exe", "sticky_notes.exe"}
 
+# ─── SLASH COMMANDS ──────────────────────────────────────────────────────
+# Automatically build a map of valid slash commands from our existing context maps
+SLASH_COMMAND_MAP = {}
 
-def detect_current_contexts(title, process, hwnd):
-    """Returns (list_of_contexts, url) for the current active window."""
-    contexts = set()
+# Map URL contexts (e.g., "google docs" -> /googledocs)
+for ctx_name in CONTEXT_URL_MAP.keys():
+    clean_name = ctx_name.replace(" ", "").lower()
+    SLASH_COMMAND_MAP[clean_name] = ctx_name
+    SLASH_COMMAND_MAP[ctx_name.lower()] = ctx_name
 
-    # URL-based contexts (for browsers)
-    url = None
-    if "firefox" in process:
-        url = get_firefox_url(hwnd)
-    elif "chrome" in process:
-        url = get_chrome_url(hwnd)
-    elif "msedge" in process or "edge" in process:
-        url = get_edge_url(hwnd)
-
-    if url:
-        url_lower = url.lower()
-        for context_name, patterns in CONTEXT_URL_MAP.items():
-            for pattern in patterns:
-                if pattern in url_lower:
-                    contexts.add(context_name)
-                    break
-    # ─── NEW: Browser fallback if no URL context was matched ───
-    if url == "":
-        if "firefox" in process:
-            contexts.add("firefox")
-        elif "chrome" in process:
-            contexts.add("chrome")
-        elif "msedge" in process or "edge" in process:
-            contexts.add("edge")
-
-    # Process-based contexts
-    for proc_key, ctx_name in CONTEXT_PROCESS_MAP.items():
-        if proc_key in process:
-            contexts.add(ctx_name)
-            break
-
-    return list(contexts), url
+# Map Process contexts (e.g., "vscode" -> /vscode)
+for ctx_name in set(CONTEXT_PROCESS_MAP.values()):
+    clean_name = ctx_name.replace(" ", "").lower()
+    SLASH_COMMAND_MAP[clean_name] = ctx_name
+    SLASH_COMMAND_MAP[ctx_name.lower()] = ctx_name
 
 
-# ─── TODO MATCHING ─────────────────────────────────────────────────────
+# ─── APP DATA HELPERS ──────────────────────────────────────────────────
 
-# Resolve paths relative to the app data dir where contexts.json/todos.json live
 def _get_app_data_dir():
     """Find the Tauri app data directory where store files live."""
     import pathlib
-    # Windows: %APPDATA%\com.sticky-notes.app\
     appdata = os.environ.get("APPDATA")
     if appdata:
         store_dir = os.path.join(appdata, "com.sticky-notes.app")
@@ -245,6 +222,20 @@ def load_contexts():
         return {}
 
 
+def _get_all_saved_contexts() -> set:
+    """Return all context names currently stored in contexts.json."""
+    store_dir = _get_app_data_dir()
+    if not store_dir:
+        return set()
+    path = os.path.join(store_dir, "contexts.json")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data.get("contexts", {}).keys())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return set()
+
+
 def get_todos_for_contexts(active_contexts):
     """Return todos whose contexts overlap with active_contexts."""
     todos = load_todos()
@@ -266,11 +257,9 @@ def get_todos_for_contexts(active_contexts):
     for todo in todos:
         tid = todo["id"]
         todo_ctx = todo_contexts.get(tid, [])
-        # Check if any of this todo's contexts match active contexts
         for tc in todo_ctx:
             tc_lower = tc.lower()
             if any(tc_lower in ac or ac in tc_lower for ac in active_lower):
-                # Attach contexts to the todo for display
                 todo_with_ctx = dict(todo)
                 todo_with_ctx["contexts"] = todo_ctx
                 matched.append(todo_with_ctx)
@@ -279,12 +268,75 @@ def get_todos_for_contexts(active_contexts):
     return matched
 
 
+# ─── CONTEXT DETECTION ─────────────────────────────────────────────────
+
+def detect_current_contexts(title, process, hwnd):
+    """Returns (list_of_contexts, url) for the current active window."""
+    contexts = set()
+
+    # URL-based contexts (for browsers)
+    url = None
+    if "firefox" in process:
+        url = get_firefox_url(hwnd)
+    elif "chrome" in process:
+        url = get_chrome_url(hwnd)
+    elif "msedge" in process or "edge" in process:
+        url = get_edge_url(hwnd)
+
+    if url:
+        url_lower = url.lower()
+        for context_name, patterns in CONTEXT_URL_MAP.items():
+            for pattern in patterns:
+                if pattern in url_lower:
+                    contexts.add(context_name)
+                    break
+
+    # Browser fallback if no URL context was matched
+    if url == "":
+        if "firefox" in process:
+            contexts.add("firefox")
+        elif "chrome" in process:
+            contexts.add("chrome")
+        elif "msedge" in process or "edge" in process:
+            contexts.add("edge")
+
+    # Process-based contexts
+    for proc_key, ctx_name in CONTEXT_PROCESS_MAP.items():
+        if proc_key in process:
+            contexts.add(ctx_name)
+            break
+
+    # ─── FUZZY MATCH: unknown slash-command contexts ────────────────────
+    # Any context saved in contexts.json that isn't in the known maps gets
+    # matched by searching its name inside the process name, window title,
+    # or active URL — so /myapp works without any map entry.
+    known_contexts = set(CONTEXT_URL_MAP.keys()) | set(CONTEXT_PROCESS_MAP.values())
+    all_saved_contexts = _get_all_saved_contexts()
+
+    title_lower = title.lower() if title else ""
+    url_lower = (url or "").lower()
+    process_lower = process.lower() if process else ""
+
+    for ctx in all_saved_contexts:
+        if ctx in known_contexts:
+            continue  # already handled above
+        ctx_lower = ctx.lower()
+        if (ctx_lower in process_lower or
+                ctx_lower in title_lower or
+                ctx_lower in url_lower):
+            contexts.add(ctx)
+            print(f"  [monitor] ✅ Fuzzy matched unknown context '{ctx}' in window signal", flush=True)
+
+    return list(contexts), url
+
+
+# ─── WINDOW MONITOR ────────────────────────────────────────────────────
+
 def monitor_loop():
     """Background thread that polls the active window and sends reminders to Rust."""
     if not HAS_WINDOW_DEPS:
         return
 
-    # Initialize COM for this background thread (uiautomation requires it)
     import comtypes
     comtypes.CoInitialize()
 
@@ -309,22 +361,16 @@ def monitor_loop():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # Check if the active window is one of our own app's windows
             is_own_window = process in OWN_APP_PROCESSES
-
             if is_own_window:
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # Detect context (URL + process mapping)
             active_contexts, url = detect_current_contexts(title, process, hwnd)
 
-            # Check if the CONTEXT SET changed (not just URL/title within same context)
             context_changed = set(active_contexts) != set(last_contexts)
 
-            # On CONTEXT CHANGE: FIRST slide popup windows left off-screen
             if context_changed:
-                # Slide todo popup windows left off-screen
                 try:
                     req = urllib.request.Request(
                         SLIDE_LEFT_URL,
@@ -335,21 +381,18 @@ def monitor_loop():
                     urllib.request.urlopen(req, timeout=2)
                 except Exception:
                     pass
-                # Wait for slide-left animation to finish
                 time.sleep(0.35)
-                # Update tracking state
                 last_contexts = active_contexts
                 last_todo_ids = []
 
-            # Find matching todos
             matched_todos = get_todos_for_contexts(active_contexts) if active_contexts else []
             current_todo_ids = [t["id"] for t in matched_todos]
             todos_changed = current_todo_ids != last_todo_ids
 
-            # Print window info if something changed
             title_changed = title != last_title
             url_changed = url != last_url
             process_changed = process != last_process
+
             if title_changed or url_changed or process_changed:
                 display_url = f" | URL: {url[:80]}" if url else ""
                 print(f"\n{'─' * 55}", flush=True)
@@ -375,12 +418,9 @@ def monitor_loop():
                 last_url = url
                 last_process = process
 
-            # If context changed and there are matching todos, slide down
             if context_changed and matched_todos:
-                # Only show undone todos
                 undone_todos = [t for t in matched_todos if t.get("status") != "done"]
                 if undone_todos:
-                    # Wait for slide-up animation to finish before sliding down
                     time.sleep(0.35)
                     try:
                         ctx_str = ", ".join(active_contexts) if active_contexts else ""
@@ -423,6 +463,24 @@ Task: {text}
 
 
 def classify_todo(text: str) -> list[str]:
+    # 1. CHECK FOR SLASH COMMANDS FIRST
+    match = re.search(r'(?:^|\s)/([a-zA-Z0-9_]+)', text)
+
+    if match:
+        cmd = match.group(1).lower()
+
+        # Known command → map to canonical name
+        if cmd in SLASH_COMMAND_MAP:
+            context_name = SLASH_COMMAND_MAP[cmd]
+            print(f"  [classify] ⚡ Slash command detected: /{cmd} -> {context_name}", flush=True)
+            return [context_name]
+
+        # ✅ Unknown command → save the raw word as context directly
+        else:
+            print(f"  [classify] ⚡ Unknown slash command: /{cmd} -> saving as-is", flush=True)
+            return [cmd]
+
+    # 2. FALLBACK TO GROQ AI
     prompt = CLASSIFY_PROMPT.format(text=text)
     payload = json.dumps({
         "model": MODEL,
@@ -446,7 +504,6 @@ def classify_todo(text: str) -> list[str]:
         content = body["choices"][0]["message"]["content"]
         print(f"  [classify] Raw response: {content!r}", flush=True)
 
-        # Try to parse the JSON response
         try:
             data = json.loads(content)
             return data.get("contexts", ["general"])
@@ -500,17 +557,14 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, format, *args):
-        # Suppress default stderr logging
         pass
 
 
 # ─── MAIN ──────────────────────────────────────────────────────────────
 def main():
-    # Start window monitor in a background daemon thread
     monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
     monitor_thread.start()
 
-    # Start HTTP server
     server = HTTPServer((HOST, PORT), Handler)
     print(f"Context classifier running on http://{HOST}:{PORT}", flush=True)
     try:
