@@ -1,18 +1,136 @@
-# Context Aware Sticky Note APP
+<p align="center">
+  <img src="assets/icon.png" alt="NudgeNote Logo" width="120"/>
+</p>
 
-A desktop sticky notes app with **context awareness** and **popup reminders**. Built with [Tauri 2](https://v2.tauri.app/), Rust, React, and TypeScript.
+<h1 align="center">NudgeNote</h1>
 
-Each note is a **todo list** with its own window — styled like a real sticky note with handwritten fonts. An AI classifier assigns each todo a context (e.g., "github", "gmail", "vscode"), and a background window monitor watches your active application. When you switch to an app with matching todos, popup reminders slide onto your screen.
+<p align="center">
+  <b>The sticky note that doesn’t wait for you — it follows you.</b>
+</p>
 
-![Popup Reminder](popup.png)
+<p align="center">
+  Turn your thoughts into AI-powered, context-aware reminders that resurface exactly when you need them.
+</p>
 
-The app detects your current context and notifies you with the relevant tasks. You can hover with your mouse to reveal and it will auto hide later.
+<p align="center">
+  <a href="YOUR_DOWNLOAD_LINK_HERE"><b>⬇️ Download NudgeNote</b></a>
+</p>
 
-![Hotkey](preferences.png)
+---
 
-The default hotkey to bring up or hide the sticky notes is Ctrl+Shift+S. It can be changed in the peferences which can be found from the app's menu in system tray.
+## ⚡ Your brain forgets. NudgeNote doesn’t.
 
-![Slash Context](slash.png)
+Most todo apps assume you’ll remember to check them.
 
-You can also force a context for a task by using /app_name or /site_name anywhere in the todo task.
+You won’t.
 
+NudgeNote flips the model:
+> Instead of you going to your tasks — your tasks come to you.
+
+---
+
+## 🧠 What it does (in one line)
+
+Write anything → AI understands context → reminders appear when relevant.
+
+---
+
+## 🚀 Features that feel like magic
+
+### 🧠 AI that understands your intent
+Just write:
+- “Finish assignment”
+- “Reply to recruiter”
+- “Buy groceries”
+
+NudgeNote automatically:
+- Detects context (work, personal, study, etc.)
+- Tags your task intelligently
+- Keeps it structured without effort
+
+---
+
+### 🪟 Always-on sticky brain
+- Toggle instantly with **Ctrl + Shift + S**
+- Stays on top of everything
+- Disappears when you don’t need it
+
+Your notes, always one shortcut away.
+
+---
+
+### 🌍 Context-aware reminders (the core magic)
+NudgeNote knows what you’re doing.
+
+So when the moment is right:
+- Your tasks quietly reappear
+- Only the relevant ones show up
+- Nothing feels random or noisy
+
+---
+
+### 🔴 Priority that actually feels important
+Not all tasks are equal.
+
+- Seen tasks
+- Unseen tasks
+- 🔴 High-priority tasks that *demand attention*
+
+---
+
+### ✏️ You’re always in control
+- Edit tasks anytime
+- Override AI context with a click
+- Fine-tune everything manually if you want
+
+---
+
+### 🔔 Smart notifications, not spam
+- Custom bounce intensity
+- Cooldown timer to avoid repetition
+- Calm when idle, active when needed
+
+---
+
+## 🧩 How it works
+
+1. Press **Ctrl + Shift + S**
+2. Write your thoughts naturally
+3. Keep working normally
+4. Watch tasks resurface at the right time
+
+That’s it.
+
+No syncing. No friction. No “check your todo list”.
+
+---
+
+## 💡 Why people love it
+
+Because it doesn’t behave like a todo app.
+
+It behaves like a second memory.
+
+> “I stopped forgetting things because I stopped relying on myself to remember them.”
+
+---
+
+## 📥 Get it
+
+<p align="center">
+  <a href="YOUR_DOWNLOAD_LINK_HERE"><b>⬇️ Download NudgeNote</b></a>
+</p>
+
+---
+
+## ⚙️ Lightweight customization
+
+- Hotkey control  
+- Popup behavior tuning  
+- Cooldown management  
+
+---
+
+<p align="center">
+  <b>NudgeNote — Your thoughts, timed perfectly.</b>
+</p>
