@@ -16,7 +16,7 @@
   <a href="https://github.com/Kar-Sarthak/sticky/releases/download/v1.0.1/NudgeNote_1.0.1_x64-setup.exe"><b>⬇️ Download NudgeNote</b></a>
 </p>
 <p align="center">
-  ⭐ Star this repo if you want a MacOS version.
+  ⭐ Like the app? Star the repo. Want a macOS version? Star it too!
 </p>
 
 
