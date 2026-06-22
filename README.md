@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/app_icon.png" alt="NudgeNote Logo" width="120"/>
+  <img src="assets/icon.png" alt="NudgeNote Logo" width="120"/>
 </p>
 
 <h1 align="center">NudgeNote</h1>
@@ -23,39 +23,36 @@
 
 ## ⚡ Your brain forgets. NudgeNote doesn’t.
 
-Most todo apps assume you’ll remember to check them.
+Most todo apps assume you’ll remember to check them. *You won’t.*
 
-You won’t.
-
-NudgeNote flips the model:
-> Instead of you going to your tasks — your tasks come to you.
+NudgeNote flips the model: *Instead of you going to your tasks — your tasks come to you.*
 
 ---
 
 ## 🧩 How it works
 
 1. Press **Ctrl + Shift + S**
-2. Write your thoughts naturally
+2. Write your tasks naturally
 3. Keep working normally
 4. Watch tasks resurface at the right time
 
-That’s it.
+That’s it. No syncing. No friction. No “check your todo list”.
 
-No syncing. No friction. No “check your todo list”.
 
-#$#
 
 ---
 
 ### 🌍 Context-aware reminders
 NudgeNote knows what you’re doing.
-
 So when the moment is right:
 - Your tasks quietly reappear
 - Only the relevant ones show up
 - Nothing feels random or noisy
 
-#$#
+<p align="center">
+  <img src="assets/1.png" alt="NudgeNote Logo" width="120"/>
+</p>
+
 
 ---
 
@@ -66,15 +63,19 @@ Not all tasks are equal.
 - Unseen tasks
 - 🔴 High-priority tasks that *demand attention*
 
+<p align="center">
+  <img src="assets/2.png" alt="NudgeNote Logo" width="120"/>
+</p>
+
 ---
 
-### 🔴 Special /commands
+### ⌨️ Special /commands
 You can manually set context while writing tasks:
 
 - `/app_name` (e.g `/perplexity`) → sets exact context  
 - `/imp` → marks task as high priority  
 
-#$#
+
 
 ---
 
