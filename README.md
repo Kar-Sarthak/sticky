@@ -100,7 +100,7 @@ NudgeNote stays out of your way and runs from the **system tray**, so it’s alw
 ## 📥 Get it
 
 <p align="center">
-  <a href="YOUR_DOWNLOAD_LINK_HERE"><b>⬇️ Download NudgeNote</b></a>
+  <a href="https://github.com/Kar-Sarthak/sticky/releases/download/v1.0.1/NudgeNote_1.0.1_x64-setup.exe"><b>⬇️ Download NudgeNote</b></a>
 </p>
 
 ---
