@@ -50,7 +50,7 @@ So when the moment is right:
 - Nothing feels random or noisy
 
 <p align="center">
-  <img src="assets/1.png" alt="NudgeNote Logo" width="120"/>
+  <img src="assets/1.png" alt="NudgeNote Logo" />
 </p>
 
 
@@ -64,7 +64,7 @@ Not all tasks are equal.
 - 🔴 High-priority tasks that *demand attention*
 
 <p align="center">
-  <img src="assets/2.png" alt="NudgeNote Logo" width="120"/>
+  <img src="assets/2.png" alt="NudgeNote Logo" />
 </p>
 
 ---
